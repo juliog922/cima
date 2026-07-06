@@ -21,7 +21,10 @@ fn main() -> cima::traits::Res<()> {
 
     println!("preflight {} (metadata only)…", model);
     let tensors = vet::preflight_deep(&repo, tag.as_deref())?;
-    println!("preflight PASS — {} tensors validated without downloading weights", tensors);
+    println!(
+        "preflight PASS — {} tensors validated without downloading weights",
+        tensors
+    );
 
     println!("pulling {}…", model);
     hub::pull(&model, false, tag.as_deref())?;

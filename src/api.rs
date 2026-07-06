@@ -216,6 +216,12 @@ pub mod queue {
         pub depth_at_enqueue: u64,
     }
 
+    impl Default for GpuQueue {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl GpuQueue {
         pub fn new() -> GpuQueue {
             GpuQueue {
@@ -986,8 +992,7 @@ pub mod server {
         let mut depth = 0i32;
         let mut in_str = false;
         let mut esc = false;
-        for i in start..b.len() {
-            let c = b[i];
+        for (i, &c) in b.iter().enumerate().skip(start) {
             if in_str {
                 if esc {
                     esc = false;
@@ -1025,12 +1030,14 @@ pub mod server {
                 Ok(j) if j.str_of("name").is_some() => {
                     let name = j.str_of("name").unwrap_or_default().to_string();
                     let args = j.get("arguments").cloned().unwrap_or(Json::obj());
-                    calls.push(Json::obj().set(
-                        "function",
-                        Json::obj()
-                            .set("name", Json::s(&name))
-                            .set("arguments", args),
-                    ));
+                    calls.push(
+                        Json::obj().set(
+                            "function",
+                            Json::obj()
+                                .set("name", Json::s(&name))
+                                .set("arguments", args),
+                        ),
+                    );
                     true
                 }
                 _ => false,
@@ -1150,86 +1157,85 @@ pub mod server {
         }
 
         // Build the prompt text + media payloads from either request shape.
-        let (prompt_is_chat, images, audio): PreparedInput =
-            if chat {
-                let mut turns: Vec<ChatTurn> = match body.arr_of("messages") {
-                    Some(msgs) => msgs
-                        .iter()
-                        .map(|m| {
-                            let mut role = m.str_of("role").unwrap_or("user").to_string();
-                            let mut content = m.str_of("content").unwrap_or("").to_string();
-                            // Tool results ride back as user-visible observations in
-                            // the dialect the tools block establishes; assistant
-                            // turns that carried tool_calls are re-rendered the same
-                            // way, so the transcript round-trips faithfully.
-                            if role == "tool" {
-                                role = "user".into();
-                                content = format!("<tool_response>\n{}\n</tool_response>", content);
-                            }
-                            if let Some(tcs) = m.arr_of("tool_calls") {
-                                for tc in tcs {
-                                    if let Some(f) = tc.get("function") {
-                                        content.push_str(&format!(
-                                            "\n<tool_call>\n{}\n</tool_call>",
-                                            f.dump()
-                                        ));
-                                    }
+        let (prompt_is_chat, images, audio): PreparedInput = if chat {
+            let mut turns: Vec<ChatTurn> = match body.arr_of("messages") {
+                Some(msgs) => msgs
+                    .iter()
+                    .map(|m| {
+                        let mut role = m.str_of("role").unwrap_or("user").to_string();
+                        let mut content = m.str_of("content").unwrap_or("").to_string();
+                        // Tool results ride back as user-visible observations in
+                        // the dialect the tools block establishes; assistant
+                        // turns that carried tool_calls are re-rendered the same
+                        // way, so the transcript round-trips faithfully.
+                        if role == "tool" {
+                            role = "user".into();
+                            content = format!("<tool_response>\n{}\n</tool_response>", content);
+                        }
+                        if let Some(tcs) = m.arr_of("tool_calls") {
+                            for tc in tcs {
+                                if let Some(f) = tc.get("function") {
+                                    content.push_str(&format!(
+                                        "\n<tool_call>\n{}\n</tool_call>",
+                                        f.dump()
+                                    ));
                                 }
                             }
-                            ChatTurn {
-                                role,
-                                content,
-                                n_images: m.arr_of("images").map(|a| a.len()).unwrap_or(0),
-                                n_audio: m.arr_of("audio").map(|a| a.len()).unwrap_or(0),
-                            }
-                        })
-                        .collect(),
-                    None => return respond_error(stream, 400, "missing required field 'messages'"),
-                };
-                if tools_active {
-                    let block = tools_prompt_block(&tools);
-                    match turns.iter_mut().find(|t| t.role == "system") {
-                        Some(sys) => sys.content.push_str(&block),
-                        None => turns.insert(
-                            0,
-                            ChatTurn {
-                                role: "system".into(),
-                                content: format!("You are a helpful assistant.{}", block),
-                                n_images: 0,
-                                n_audio: 0,
-                            },
-                        ),
-                    }
-                }
-                if let Some(instr) = &fmt_instr {
-                    if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
-                        last_user.content.push_str(instr);
-                    }
-                }
-                let mut imgs = Vec::new();
-                let mut auds = Vec::new();
-                for m in body.arr_of("messages").unwrap_or(&[]) {
-                    match parse_media(m, "images") {
-                        Ok(v) => imgs.extend(v),
-                        Err(e) => return respond_error(stream, 400, &e.to_string()),
-                    }
-                    match parse_media(m, "audio") {
-                        Ok(v) => auds.extend(v),
-                        Err(e) => return respond_error(stream, 400, &e.to_string()),
-                    }
-                }
-                (Some(turns), imgs, auds)
-            } else {
-                let imgs = match parse_media(&body, "images") {
-                    Ok(v) => v,
-                    Err(e) => return respond_error(stream, 400, &e.to_string()),
-                };
-                let auds = match parse_media(&body, "audio") {
-                    Ok(v) => v,
-                    Err(e) => return respond_error(stream, 400, &e.to_string()),
-                };
-                (None, imgs, auds)
+                        }
+                        ChatTurn {
+                            role,
+                            content,
+                            n_images: m.arr_of("images").map(|a| a.len()).unwrap_or(0),
+                            n_audio: m.arr_of("audio").map(|a| a.len()).unwrap_or(0),
+                        }
+                    })
+                    .collect(),
+                None => return respond_error(stream, 400, "missing required field 'messages'"),
             };
+            if tools_active {
+                let block = tools_prompt_block(&tools);
+                match turns.iter_mut().find(|t| t.role == "system") {
+                    Some(sys) => sys.content.push_str(&block),
+                    None => turns.insert(
+                        0,
+                        ChatTurn {
+                            role: "system".into(),
+                            content: format!("You are a helpful assistant.{}", block),
+                            n_images: 0,
+                            n_audio: 0,
+                        },
+                    ),
+                }
+            }
+            if let Some(instr) = &fmt_instr {
+                if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
+                    last_user.content.push_str(instr);
+                }
+            }
+            let mut imgs = Vec::new();
+            let mut auds = Vec::new();
+            for m in body.arr_of("messages").unwrap_or(&[]) {
+                match parse_media(m, "images") {
+                    Ok(v) => imgs.extend(v),
+                    Err(e) => return respond_error(stream, 400, &e.to_string()),
+                }
+                match parse_media(m, "audio") {
+                    Ok(v) => auds.extend(v),
+                    Err(e) => return respond_error(stream, 400, &e.to_string()),
+                }
+            }
+            (Some(turns), imgs, auds)
+        } else {
+            let imgs = match parse_media(&body, "images") {
+                Ok(v) => v,
+                Err(e) => return respond_error(stream, 400, &e.to_string()),
+            };
+            let auds = match parse_media(&body, "audio") {
+                Ok(v) => v,
+                Err(e) => return respond_error(stream, 400, &e.to_string()),
+            };
+            (None, imgs, auds)
+        };
 
         // ---- GPU admission: strict FIFO, wait time measured; bounded
         // when CIMA_MAX_QUEUE is set (fast 429 over invisible latency) ----
@@ -1240,7 +1246,11 @@ pub mod server {
                     "request refused: model={} queue depth {} at CIMA_MAX_QUEUE cap",
                     model, depth
                 ));
-                return respond_error(stream, 429, "server busy: request queue is full (CIMA_MAX_QUEUE)");
+                return respond_error(
+                    stream,
+                    429,
+                    "server busy: request queue is full (CIMA_MAX_QUEUE)",
+                );
             }
         };
         log::info(&format!(
@@ -1426,7 +1436,11 @@ pub mod server {
         let permit = match server.queue.try_acquire() {
             Ok(p) => p,
             Err(_) => {
-                return respond_error(stream, 429, "server busy: request queue is full (CIMA_MAX_QUEUE)")
+                return respond_error(
+                    stream,
+                    429,
+                    "server busy: request queue is full (CIMA_MAX_QUEUE)",
+                )
             }
         };
         let mut mgr = server.manager.lock().unwrap();
@@ -1505,11 +1519,7 @@ pub mod server {
                     .set("local", Json::b(present.contains(e.id)))
             })
             .collect();
-        respond_json(
-            stream,
-            200,
-            &Json::obj().set("models", Json::Arr(models)),
-        );
+        respond_json(stream, 200, &Json::obj().set("models", Json::Arr(models)));
     }
 
     fn handle_tags(stream: &mut TcpStream) {
@@ -1523,7 +1533,11 @@ pub mod server {
             // safetensors. `caps` (text / text+vision+audio) is disk-truth
             // from list_local_caps, so surface it as the family rather than
             // hardcoding "transformer".
-            let format = if name.contains(':') { "gguf" } else { "safetensors" };
+            let format = if name.contains(':') {
+                "gguf"
+            } else {
+                "safetensors"
+            };
             models.push(
                 Json::obj()
                     .set("name", Json::s(&name))
@@ -1712,7 +1726,11 @@ pub mod server {
 
         let requested: Vec<String> = body
             .arr_of("models")
-            .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_owned)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default();
 
         if requested.is_empty() {
@@ -1918,7 +1936,9 @@ pub mod server {
         let startup = server.startup.clone();
         if startup.required.is_empty() {
             // Nothing gated — ready is simply liveness.
-            startup.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            startup
+                .done
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         std::thread::spawn(move || {
@@ -2024,7 +2044,9 @@ pub mod server {
                 }
             }
             startup.set_phase("complete".to_string());
-            startup.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            startup
+                .done
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             log::info(&format!(
                 "startup pull: all {} model(s) present — ready",
                 total
@@ -2162,8 +2184,14 @@ pub mod server {
             let f = calls[0].get("function").unwrap();
             assert_eq!(f.str_of("name"), Some("get_weather"));
             assert_eq!(f.get("arguments").unwrap().str_of("city"), Some("Paris"));
-            assert!(text.contains("The weather in Paris is sunny."), "prose lost: {text:?}");
-            assert!(!text.contains("get_weather"), "call leaked into content: {text:?}");
+            assert!(
+                text.contains("The weather in Paris is sunny."),
+                "prose lost: {text:?}"
+            );
+            assert!(
+                !text.contains("get_weather"),
+                "call leaked into content: {text:?}"
+            );
         }
 
         #[test]

@@ -927,9 +927,8 @@ impl Transformer {
             k: ctx.alloc(CHUNK * kvd * 2)?,
             v: ctx.alloc(CHUNK * kvd * 2)?,
             qkv: ctx.alloc((qd + 2 * kvd) * 2)?,
-            att_part: ctx.alloc(
-                cfg.n_heads * ((cfg.max_seq + ATT_CSZ - 1) / ATT_CSZ) * (cfg.head_dim + 2) * 4,
-            )?,
+            att_part: ctx
+                .alloc(cfg.n_heads * cfg.max_seq.div_ceil(ATT_CSZ) * (cfg.head_dim + 2) * 4)?,
             cand: ctx.alloc(SAMPLE_TOPK * 8)?,
             hist_ring: ctx.alloc(64 * 4)?,
             hist_counts: ctx.alloc(cfg.vocab_size * 4)?,
@@ -1135,7 +1134,7 @@ impl Transformer {
             if rows == 1 {
                 let scale = 1.0 / (c.head_dim as f32).sqrt();
                 if c.head_dim % 32 == 0 && c.head_dim <= 128 {
-                    let nc = (c.max_seq + ATT_CSZ - 1) / ATT_CSZ;
+                    let nc = c.max_seq.div_ceil(ATT_CSZ);
                     ctx.attn_decode_split(
                         q_p,
                         layer.k_cache.ptr,

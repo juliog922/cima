@@ -198,7 +198,13 @@ pub(crate) fn fetch_span(model: &str, name: &str, from: u64, to: u64) -> Res<Vec
         }
         if rc != 0 {
             let msg = std::ffi::CStr::from_ptr(curl_easy_strerror(rc)).to_string_lossy();
-            return Err(err!("hub", "range fetch failed for {}: curl error {} ({})", url, rc, msg));
+            return Err(err!(
+                "hub",
+                "range fetch failed for {}: curl error {} ({})",
+                url,
+                rc,
+                msg
+            ));
         }
         let mut code: c_long = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &mut code as *mut c_long);
@@ -848,7 +854,7 @@ pub fn quant_tag(file: &str) -> String {
     // take the trailing [-][segment] that looks like a quant tag: every
     // published scheme (Q4_K_M, q8_0, IQ4_XS, UD-Q4_K_XL, F16, bf16)
     // contains a digit, which prose segments ("instruct", "it") never do.
-    match stem.rfind(|c: char| c == '-').map(|i| &stem[i + 1..]) {
+    match stem.rfind('-').map(|i| &stem[i + 1..]) {
         Some(t)
             if t.chars()
                 .next()
@@ -1081,7 +1087,14 @@ pub mod vet {
     /// with the loader gates in `models/transformer.rs` (safetensors) and
     /// `formats::gguf::translate_name` (GGUF).
     const PREFLIGHT_ARCHS: &[&str] = &[
-        "llama", "mistral", "qwen2", "qwen2_vl", "qwen2_5_vl", "qwen2_audio", "llava", "gemma4",
+        "llama",
+        "mistral",
+        "qwen2",
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen2_audio",
+        "llava",
+        "gemma4",
         "gemma3n",
     ];
 
@@ -1161,7 +1174,15 @@ pub mod vet {
             match gguf::parse_header_bytes(&buf) {
                 Ok(parsed) => break parsed,
                 Err(_) if want < cap && to < size.saturating_sub(1) => want *= 2,
-                Err(e) => return Err(err!("vet", "{}: header did not parse within {} MiB: {}", name, want >> 20, e)),
+                Err(e) => {
+                    return Err(err!(
+                        "vet",
+                        "{}: header did not parse within {} MiB: {}",
+                        name,
+                        want >> 20,
+                        e
+                    ))
+                }
             }
         };
         let arch = meta
@@ -1261,7 +1282,11 @@ pub mod vet {
         for (name, size) in files.iter().filter(|(n, _)| n.ends_with(".safetensors")) {
             let head = crate::hub::fetch_span(model, name, 0, 7)?;
             if head.len() < 8 {
-                return Err(err!("vet", "{}: could not read the 8-byte header length", name));
+                return Err(err!(
+                    "vet",
+                    "{}: could not read the 8-byte header length",
+                    name
+                ));
             }
             let hlen = u64::from_le_bytes(head[..8].try_into().unwrap());
             if hlen == 0 || hlen > (256 << 20) || hlen + 8 > *size {
@@ -1684,7 +1709,9 @@ mod selector_tests {
             std::fs::write(dir.join("qwen2.5-0.5b-instruct-q8_0.gguf"), b"x").unwrap();
             let names: Vec<String> = list_local_caps().into_iter().map(|(n, ..)| n).collect();
             assert!(
-                names.iter().any(|n| n == "Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0"),
+                names
+                    .iter()
+                    .any(|n| n == "Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0"),
                 "expected single-tag name, got {names:?}"
             );
             assert!(
@@ -1786,7 +1813,10 @@ mod selector_tests {
         let st = root.join("Org__STModel");
         std::fs::create_dir_all(&st).unwrap();
         std::fs::write(st.join("config.json"), "{}").unwrap();
-        assert!(!is_local_in(&root, "Org/STModel"), "config alone is not enough");
+        assert!(
+            !is_local_in(&root, "Org/STModel"),
+            "config alone is not enough"
+        );
         std::fs::write(st.join("model.safetensors"), b"x").unwrap();
         assert!(is_local_in(&root, "Org/STModel"));
 

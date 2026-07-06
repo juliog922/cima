@@ -56,7 +56,12 @@ extern "C" {
     fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     fn cuMemHostRegister_v2(p: *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
     fn cuMemHostUnregister(p: *mut c_void) -> CUresult;
-    fn cuMemcpyHtoDAsync_v2(dst: CUdeviceptr, src: *const c_void, n: usize, s: CUstream) -> CUresult;
+    fn cuMemcpyHtoDAsync_v2(
+        dst: CUdeviceptr,
+        src: *const c_void,
+        n: usize,
+        s: CUstream,
+    ) -> CUresult;
     fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: CUdeviceptr, n: usize, s: CUstream) -> CUresult;
     fn cuEventCreate(ev: *mut CUevent, flags: c_uint) -> CUresult;
     fn cuEventRecord(ev: CUevent, stream: CUstream) -> CUresult;
@@ -71,14 +76,26 @@ extern "C" {
     fn cuStreamCreate(s: *mut CUstream, flags: c_uint) -> CUresult;
     fn cuStreamSynchronize(s: CUstream) -> CUresult;
     fn cuModuleLoadData(m: *mut CUmodule, image: *const c_void) -> CUresult;
-    fn cuModuleLoadDataEx(m: *mut CUmodule, image: *const c_void, n: c_uint, opts: *mut c_uint, vals: *mut *mut c_void) -> CUresult;
+    fn cuModuleLoadDataEx(
+        m: *mut CUmodule,
+        image: *const c_void,
+        n: c_uint,
+        opts: *mut c_uint,
+        vals: *mut *mut c_void,
+    ) -> CUresult;
     fn cuModuleGetFunction(f: *mut CUfunction, m: CUmodule, name: *const c_char) -> CUresult;
     fn cuLaunchKernel(
         f: CUfunction,
-        gx: c_uint, gy: c_uint, gz: c_uint,
-        bx: c_uint, by: c_uint, bz: c_uint,
-        shmem: c_uint, stream: CUstream,
-        params: *mut *mut c_void, extra: *mut *mut c_void,
+        gx: c_uint,
+        gy: c_uint,
+        gz: c_uint,
+        bx: c_uint,
+        by: c_uint,
+        bz: c_uint,
+        shmem: c_uint,
+        stream: CUstream,
+        params: *mut *mut c_void,
+        extra: *mut *mut c_void,
     ) -> CUresult;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
     fn cuGetErrorString(e: CUresult, s: *mut *const c_char) -> CUresult;
@@ -103,7 +120,10 @@ static FLIGHT: std::sync::Mutex<std::collections::VecDeque<String>> =
 /// Sticky, context-fatal CUresults (CUDA driver docs: "the context cannot
 /// be used" after these). 701 (launch out of resources) is NOT sticky.
 fn cu_fatal(code: CUresult) -> bool {
-    matches!(code, 700 | 702 | 710 | 713 | 714 | 715 | 716 | 717 | 718 | 719)
+    matches!(
+        code,
+        700 | 702 | 710 | 713 | 714 | 715 | 716 | 717 | 718 | 719
+    )
 }
 
 pub fn context_poisoned() -> bool {
@@ -134,7 +154,10 @@ pub fn reset_primary(gpu_index: u32) -> Res<()> {
         let _ = cuCtxSetCurrent(std::ptr::null_mut());
         let rel = cuDevicePrimaryCtxRelease_v2(dev);
         if rel != 0 {
-            log::warn(&format!("primary ctx release on the dead context: CUresult {} (ignored)", rel));
+            log::warn(&format!(
+                "primary ctx release on the dead context: CUresult {} (ignored)",
+                rel
+            ));
         }
         for attempt in 0..5 {
             let rc = cuDevicePrimaryCtxReset_v2(dev);
@@ -143,11 +166,18 @@ pub fn reset_primary(gpu_index: u32) -> Res<()> {
                 log::warn("primary CUDA context reset — device state cleared");
                 return Ok(());
             }
-            log::warn(&format!("cuDevicePrimaryCtxReset attempt {}: CUresult {}", attempt + 1, rc));
+            log::warn(&format!(
+                "cuDevicePrimaryCtxReset attempt {}: CUresult {}",
+                attempt + 1,
+                rc
+            ));
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
-    Err(err!("cuda", "primary context reset failed after 5 attempts — device requires process restart"))
+    Err(err!(
+        "cuda",
+        "primary context reset failed after 5 attempts — device requires process restart"
+    ))
 }
 
 fn cu_check(code: CUresult, what: &str) -> Res<()> {
@@ -157,7 +187,11 @@ fn cu_check(code: CUresult, what: &str) -> Res<()> {
     let mut s: *const c_char = ptr::null();
     let msg = unsafe {
         cuGetErrorString(code, &mut s);
-        if s.is_null() { "unknown".to_string() } else { CStr::from_ptr(s).to_string_lossy().into_owned() }
+        if s.is_null() {
+            "unknown".to_string()
+        } else {
+            CStr::from_ptr(s).to_string_lossy().into_owned()
+        }
     };
     if cu_fatal(code) && !CTX_POISONED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         let recent = FLIGHT
@@ -181,8 +215,12 @@ type nvrtcProgram = *mut c_void;
 
 extern "C" {
     fn nvrtcCreateProgram(
-        p: *mut nvrtcProgram, src: *const c_char, name: *const c_char,
-        n_hdr: c_int, hdrs: *const *const c_char, inc: *const *const c_char,
+        p: *mut nvrtcProgram,
+        src: *const c_char,
+        name: *const c_char,
+        n_hdr: c_int,
+        hdrs: *const *const c_char,
+        inc: *const *const c_char,
     ) -> nvrtcResult;
     fn nvrtcCompileProgram(p: nvrtcProgram, n: c_int, opts: *const *const c_char) -> nvrtcResult;
     fn nvrtcGetPTXSize(p: nvrtcProgram, n: *mut usize) -> nvrtcResult;
@@ -215,14 +253,25 @@ const CUBLAS_GEMM_DEFAULT: c_int = -1;
 // is what lets the slim container image ship without ~480 MB of
 // libcublas/Lt — the binary's only hard CUDA userspace need is NVRTC.
 type CublasGemmExFn = unsafe extern "C" fn(
-    h: cublasHandle, ta: c_int, tb: c_int,
-    m: c_int, n: c_int, k: c_int,
+    h: cublasHandle,
+    ta: c_int,
+    tb: c_int,
+    m: c_int,
+    n: c_int,
+    k: c_int,
     alpha: *const c_void,
-    a: *const c_void, atype: c_int, lda: c_int,
-    b: *const c_void, btype: c_int, ldb: c_int,
+    a: *const c_void,
+    atype: c_int,
+    lda: c_int,
+    b: *const c_void,
+    btype: c_int,
+    ldb: c_int,
     beta: *const c_void,
-    c: *mut c_void, ctype: c_int, ldc: c_int,
-    compute: c_int, algo: c_int,
+    c: *mut c_void,
+    ctype: c_int,
+    ldc: c_int,
+    compute: c_int,
+    algo: c_int,
 ) -> cublasStatus;
 
 struct Blas {
@@ -254,7 +303,10 @@ const RTLD_NOW: c_int = 2;
 /// `CIMA_CUBLAS`) so existing scripts keep working.
 unsafe fn try_load_cublas(stream: CUstream) -> Option<Blas> {
     let force_off = matches!(
-        std::env::var("CIMA_NO_CUBLAS").ok().as_deref().map(str::trim),
+        std::env::var("CIMA_NO_CUBLAS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
         Some("1") | Some("true") | Some("yes") | Some("on")
     );
     let opt_in = matches!(
@@ -278,8 +330,10 @@ unsafe fn try_load_cublas(stream: CUstream) -> Option<Blas> {
     if create.is_null() || set_stream.is_null() || gemm_ex.is_null() {
         return None;
     }
-    let create: unsafe extern "C" fn(*mut cublasHandle) -> cublasStatus = std::mem::transmute(create);
-    let set_stream: unsafe extern "C" fn(cublasHandle, CUstream) -> cublasStatus = std::mem::transmute(set_stream);
+    let create: unsafe extern "C" fn(*mut cublasHandle) -> cublasStatus =
+        std::mem::transmute(create);
+    let set_stream: unsafe extern "C" fn(cublasHandle, CUstream) -> cublasStatus =
+        std::mem::transmute(set_stream);
     let mut handle: cublasHandle = std::ptr::null_mut();
     if create(&mut handle) != 0 {
         return None;
@@ -301,7 +355,10 @@ unsafe fn try_load_cublas(stream: CUstream) -> Option<Blas> {
             std::mem::transmute(set_atomics);
         set_atomics(handle, CUBLAS_ATOMICS_NOT_ALLOWED);
     }
-    Some(Blas { handle, gemm_ex: std::mem::transmute::<*mut c_void, CublasGemmExFn>(gemm_ex) })
+    Some(Blas {
+        handle,
+        gemm_ex: std::mem::transmute::<*mut c_void, CublasGemmExFn>(gemm_ex),
+    })
 }
 
 // ===========================================================================
@@ -379,7 +436,11 @@ pub const ATT_CSZ: usize = 128;
 /// `k_slot_take`: returns (logit value after any softcap, vocab index).
 pub fn unpack_candidate(packed: u64) -> (f32, u32) {
     let o = (packed >> 32) as u32;
-    let bits = if o & 0x8000_0000 != 0 { o ^ 0x8000_0000 } else { !o };
+    let bits = if o & 0x8000_0000 != 0 {
+        o ^ 0x8000_0000
+    } else {
+        !o
+    };
     (f32::from_bits(bits), packed as u32)
 }
 
@@ -394,7 +455,10 @@ unsafe impl Send for TokenFetch {}
 
 impl TokenFetch {
     pub fn wait(&self) -> Res<u32> {
-        cu_check(unsafe { cuEventSynchronize(self.event) }, "cuEventSynchronize")?;
+        cu_check(
+            unsafe { cuEventSynchronize(self.event) },
+            "cuEventSynchronize",
+        )?;
         let packed = unsafe { *(self.host as *const u64) };
         Ok(packed as u32)
     }
@@ -427,10 +491,17 @@ unsafe impl Send for PinnedBuf {}
 impl PinnedBuf {
     /// View as a typed slice. Caller guarantees `T` layout fits.
     pub fn as_slice<T>(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.bytes / std::mem::size_of::<T>()) }
+        unsafe {
+            std::slice::from_raw_parts(self.ptr as *const T, self.bytes / std::mem::size_of::<T>())
+        }
     }
     pub fn as_mut_slice<T>(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.bytes / std::mem::size_of::<T>()) }
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.ptr as *mut T,
+                self.bytes / std::mem::size_of::<T>(),
+            )
+        }
     }
 }
 
@@ -589,7 +660,12 @@ impl CudaCtx {
             if trace {
                 let (mut free, mut total) = (0usize, 0usize);
                 if unsafe { cuMemGetInfo_v2(&mut free, &mut total) } == 0 {
-                    eprintln!("vram-trace {:<18} free {:>8.3} GiB of {:.3}", label, free as f64 / (1 << 30) as f64, total as f64 / (1 << 30) as f64);
+                    eprintln!(
+                        "vram-trace {:<18} free {:>8.3} GiB of {:.3}",
+                        label,
+                        free as f64 / (1 << 30) as f64,
+                        total as f64 / (1 << 30) as f64
+                    );
                 }
             }
         };
@@ -599,7 +675,10 @@ impl CudaCtx {
             cu_check(cuDeviceGet(&mut dev, gpu_index as c_int), "cuDeviceGet")?;
 
             let mut name = [0 as c_char; 128];
-            cu_check(cuDeviceGetName(name.as_mut_ptr(), 128, dev), "cuDeviceGetName")?;
+            cu_check(
+                cuDeviceGetName(name.as_mut_ptr(), 128, dev),
+                "cuDeviceGetName",
+            )?;
             let device_name = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
 
             // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR=75, MINOR=76
@@ -608,12 +687,18 @@ impl CudaCtx {
             cu_check(cuDeviceGetAttribute(&mut min, 76, dev), "cc minor")?;
 
             let mut ctx: CUcontext = ptr::null_mut();
-            cu_check(cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
+            cu_check(
+                cuDevicePrimaryCtxRetain(&mut ctx, dev),
+                "cuDevicePrimaryCtxRetain",
+            )?;
             cu_check(cuCtxSetCurrent(ctx), "cuCtxSetCurrent")?;
             stage("primary-context");
 
             let mut stream: CUstream = ptr::null_mut();
-            cu_check(cuStreamCreate(&mut stream, 1 /*NON_BLOCKING*/), "cuStreamCreate")?;
+            cu_check(
+                cuStreamCreate(&mut stream, 1 /*NON_BLOCKING*/),
+                "cuStreamCreate",
+            )?;
 
             let blas = try_load_cublas(stream);
             crate::log::info(match &blas {
@@ -624,7 +709,10 @@ impl CudaCtx {
 
             // NVML
             if nvmlInit_v2() != 0 {
-                return Err(err!("cuda", "nvmlInit failed — is the Nvidia driver loaded?"));
+                return Err(err!(
+                    "cuda",
+                    "nvmlInit failed — is the Nvidia driver loaded?"
+                ));
             }
             let mut nvml: nvmlDevice = ptr::null_mut();
             if nvmlDeviceGetHandleByIndex_v2(gpu_index, &mut nvml) != 0 {
@@ -640,9 +728,19 @@ impl CudaCtx {
                 const CU_JIT_ERROR_LOG_BUFFER: c_uint = 5;
                 const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: c_uint = 6;
                 let mut errlog = vec![0u8; 16 * 1024];
-                let mut optv: [c_uint; 2] = [CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES];
-                let mut vals: [*mut c_void; 2] = [errlog.as_mut_ptr() as *mut c_void, errlog.len() as *mut c_void];
-                let rc = cuModuleLoadDataEx(&mut module, ptx.as_ptr() as *const c_void, 2, optv.as_mut_ptr(), vals.as_mut_ptr());
+                let mut optv: [c_uint; 2] =
+                    [CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES];
+                let mut vals: [*mut c_void; 2] = [
+                    errlog.as_mut_ptr() as *mut c_void,
+                    errlog.len() as *mut c_void,
+                ];
+                let rc = cuModuleLoadDataEx(
+                    &mut module,
+                    ptx.as_ptr() as *const c_void,
+                    2,
+                    optv.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                );
                 if rc != 0 {
                     let msg = String::from_utf8_lossy(&errlog)
                         .trim_end_matches('\0')
@@ -652,13 +750,18 @@ impl CudaCtx {
                         "cuda",
                         "PTX JIT failed (CUresult {}): {}",
                         rc,
-                        if msg.is_empty() { "(driver gave no log)".to_string() } else { msg }
+                        if msg.is_empty() {
+                            "(driver gave no log)".to_string()
+                        } else {
+                            msg
+                        }
                     ));
                 }
             }
             stage("jit-module");
 
-            let mut fn_names: std::collections::HashMap<usize, &'static str> = std::collections::HashMap::new();
+            let mut fn_names: std::collections::HashMap<usize, &'static str> =
+                std::collections::HashMap::new();
             let mut f = |n: &'static str| -> Res<CUfunction> {
                 let cname = CString::new(n).unwrap();
                 let mut func: CUfunction = ptr::null_mut();
@@ -735,8 +838,8 @@ impl CudaCtx {
             ));
 
             Ok(CudaCtx {
-            gpu_index,
-            fn_names,
+                gpu_index,
+                fn_names,
                 q8_scratch: std::sync::Mutex::new(None),
                 dev,
                 ctx,
@@ -758,7 +861,11 @@ impl CudaCtx {
     /// Driver-truth telemetry snapshot via NVML.
     pub fn snapshot(&self) -> GpuSnapshot {
         unsafe {
-            let mut mem = NvmlMemory { total: 0, free: 0, used: 0 };
+            let mut mem = NvmlMemory {
+                total: 0,
+                free: 0,
+                used: 0,
+            };
             let mut util = NvmlUtilization { gpu: 0, memory: 0 };
             let mut temp: c_uint = 0;
             nvmlDeviceGetMemoryInfo(self.nvml, &mut mem);
@@ -798,7 +905,11 @@ impl CudaCtx {
             return Err(err!(
                 "cuda",
                 "cuMemAlloc({}) failed (CUresult {}). VRAM free={} total={} engine-tracked={}",
-                fmt_bytes(bytes), code, fmt_bytes(free), fmt_bytes(total), fmt_bytes(self.tracked_bytes())
+                fmt_bytes(bytes),
+                code,
+                fmt_bytes(free),
+                fmt_bytes(total),
+                fmt_bytes(self.tracked_bytes())
             ));
         }
         DEVICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
@@ -808,7 +919,10 @@ impl CudaCtx {
     /// Allocate pinned host memory for low-latency H<->D bounce buffers.
     pub fn alloc_pinned(&self, bytes: usize) -> Res<PinnedBuf> {
         let mut p: *mut c_void = ptr::null_mut();
-        cu_check(unsafe { cuMemAllocHost_v2(&mut p, bytes.max(1)) }, "cuMemAllocHost")?;
+        cu_check(
+            unsafe { cuMemAllocHost_v2(&mut p, bytes.max(1)) },
+            "cuMemAllocHost",
+        )?;
         Ok(PinnedBuf { ptr: p, bytes })
     }
 
@@ -829,7 +943,14 @@ impl CudaCtx {
     pub fn htod(&self, dst: &DeviceBuf, src: &[u8]) -> Res<()> {
         debug_assert!(src.len() <= dst.bytes);
         cu_check(
-            unsafe { cuMemcpyHtoDAsync_v2(dst.ptr, src.as_ptr() as *const c_void, src.len(), self.stream) },
+            unsafe {
+                cuMemcpyHtoDAsync_v2(
+                    dst.ptr,
+                    src.as_ptr() as *const c_void,
+                    src.len(),
+                    self.stream,
+                )
+            },
             "cuMemcpyHtoDAsync",
         )
     }
@@ -837,7 +958,14 @@ impl CudaCtx {
     pub fn dtoh(&self, dst: &mut [u8], src: &DeviceBuf) -> Res<()> {
         debug_assert!(dst.len() <= src.bytes);
         cu_check(
-            unsafe { cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src.ptr, dst.len(), self.stream) },
+            unsafe {
+                cuMemcpyDtoHAsync_v2(
+                    dst.as_mut_ptr() as *mut c_void,
+                    src.ptr,
+                    dst.len(),
+                    self.stream,
+                )
+            },
             "cuMemcpyDtoHAsync",
         )
     }
@@ -846,18 +974,26 @@ impl CudaCtx {
     /// synchronized before returning so the host slice is immediately valid.
     pub fn dtoh_at(&self, dst: &mut [u8], src: CUdeviceptr) -> Res<()> {
         cu_check(
-            unsafe { cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src, dst.len(), self.stream) },
+            unsafe {
+                cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src, dst.len(), self.stream)
+            },
             "cuMemcpyDtoHAsync",
         )?;
         self.sync()
     }
 
     pub fn dtod(&self, dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Res<()> {
-        cu_check(unsafe { cuMemcpyDtoDAsync_v2(dst, src, bytes, self.stream) }, "cuMemcpyDtoD")
+        cu_check(
+            unsafe { cuMemcpyDtoDAsync_v2(dst, src, bytes, self.stream) },
+            "cuMemcpyDtoD",
+        )
     }
 
     pub fn memset(&self, buf: &DeviceBuf) -> Res<()> {
-        cu_check(unsafe { cuMemsetD8Async(buf.ptr, 0, buf.bytes, self.stream) }, "cuMemsetD8")
+        cu_check(
+            unsafe { cuMemsetD8Async(buf.ptr, 0, buf.bytes, self.stream) },
+            "cuMemsetD8",
+        )
     }
 
     /// Capture everything enqueued between begin/end into a replayable
@@ -880,12 +1016,18 @@ impl CudaCtx {
     /// stacks such as WSL2). Position-dependent kernels read a device
     /// counter, so a single captured step replays at every position.
     pub fn capture_begin(&self) -> Res<()> {
-        cu_check(unsafe { cuStreamBeginCapture_v2(self.stream, 0) }, "cuStreamBeginCapture")
+        cu_check(
+            unsafe { cuStreamBeginCapture_v2(self.stream, 0) },
+            "cuStreamBeginCapture",
+        )
     }
 
     pub fn capture_end(&self) -> Res<GraphExec> {
         let mut graph: CUgraph = std::ptr::null_mut();
-        cu_check(unsafe { cuStreamEndCapture(self.stream, &mut graph) }, "cuStreamEndCapture")?;
+        cu_check(
+            unsafe { cuStreamEndCapture(self.stream, &mut graph) },
+            "cuStreamEndCapture",
+        )?;
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let r = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
         unsafe { cuGraphDestroy(graph) };
@@ -894,8 +1036,12 @@ impl CudaCtx {
     }
 
     pub fn graph_launch(&self, g: &GraphExec) -> Res<()> {
-        self.launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        cu_check(unsafe { cuGraphLaunch(g.exec, self.stream) }, "cuGraphLaunch")
+        self.launches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cu_check(
+            unsafe { cuGraphLaunch(g.exec, self.stream) },
+            "cuGraphLaunch",
+        )
     }
 
     /// Kernel-submission counter (profiling): graphs count as one.
@@ -904,23 +1050,49 @@ impl CudaCtx {
     }
 
     pub fn sync(&self) -> Res<()> {
-        cu_check(unsafe { cuStreamSynchronize(self.stream) }, "cuStreamSynchronize")
+        cu_check(
+            unsafe { cuStreamSynchronize(self.stream) },
+            "cuStreamSynchronize",
+        )
     }
 
     // --------------------------------------------------------------- kernels
 
-    fn launch(&self, f: CUfunction, grid: (u32, u32, u32), block: u32, shmem: u32, args: &mut [*mut c_void]) -> Res<()> {
-        self.launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    fn launch(
+        &self,
+        f: CUfunction,
+        grid: (u32, u32, u32),
+        block: u32,
+        shmem: u32,
+        args: &mut [*mut c_void],
+    ) -> Res<()> {
+        self.launches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         record_op(format!(
             "{}[{}x{}x{}/{}]",
-            self.fn_names.get(&(f as usize)).copied().unwrap_or("?kernel"),
-            grid.0, grid.1, grid.2, block
+            self.fn_names
+                .get(&(f as usize))
+                .copied()
+                .unwrap_or("?kernel"),
+            grid.0,
+            grid.1,
+            grid.2,
+            block
         ));
         cu_check(
             unsafe {
                 cuLaunchKernel(
-                    f, grid.0, grid.1, grid.2, block, 1, 1, shmem, self.stream,
-                    args.as_mut_ptr(), ptr::null_mut(),
+                    f,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block,
+                    1,
+                    1,
+                    shmem,
+                    self.stream,
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
                 )
             },
             "cuLaunchKernel",
@@ -929,7 +1101,15 @@ impl CudaCtx {
 
     /// `out[row,:] = table[ids[row],:]` — embedding lookup. `table_bf16`
     /// selects the source dtype; output is always f16 activations.
-    pub fn gather(&self, table: u64, table_bf16: bool, ids: u64, out: u64, rows: usize, hidden: usize) -> Res<()> {
+    pub fn gather(
+        &self,
+        table: u64,
+        table_bf16: bool,
+        ids: u64,
+        out: u64,
+        rows: usize,
+        hidden: usize,
+    ) -> Res<()> {
         let (mut t, mut i, mut o, mut h) = (table, ids, out, hidden as c_int);
         let mut args = [
             &mut t as *mut _ as *mut c_void,
@@ -937,7 +1117,11 @@ impl CudaCtx {
             &mut o as *mut _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
         ];
-        let f = if table_bf16 { self.funcs.gather_bf16 } else { self.funcs.gather_f16 };
+        let f = if table_bf16 {
+            self.funcs.gather_bf16
+        } else {
+            self.funcs.gather_f16
+        };
         self.launch(f, (rows as u32, 1, 1), 256, 0, &mut args)
     }
 
@@ -952,11 +1136,26 @@ impl CudaCtx {
             &mut na as *mut _ as *mut c_void,
             &mut ea as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.rmsnorm, (rows as u32, 1, 1), block, block * 4, &mut args)
+        self.launch(
+            self.funcs.rmsnorm,
+            (rows as u32, 1, 1),
+            block,
+            block * 4,
+            &mut args,
+        )
     }
 
     /// LayerNorm `[rows, n]` with weight + bias (ViT / audio encoder towers).
-    pub fn layernorm(&self, x: u64, w: u64, b: u64, y: u64, rows: usize, n: usize, eps: f32) -> Res<()> {
+    pub fn layernorm(
+        &self,
+        x: u64,
+        w: u64,
+        b: u64,
+        y: u64,
+        rows: usize,
+        n: usize,
+        eps: f32,
+    ) -> Res<()> {
         let block = 256u32;
         let (mut xa, mut wa, mut ba, mut ya, mut na, mut ea) = (x, w, b, y, n as c_int, eps);
         let mut args = [
@@ -967,7 +1166,13 @@ impl CudaCtx {
             &mut na as *mut _ as *mut c_void,
             &mut ea as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.layernorm, (rows as u32, 1, 1), block, block * 4, &mut args)
+        self.launch(
+            self.funcs.layernorm,
+            (rows as u32, 1, 1),
+            block,
+            block * 4,
+            &mut args,
+        )
     }
 
     /// `a += b` over `n` f16 elements.
@@ -978,7 +1183,13 @@ impl CudaCtx {
             &mut ba as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.add, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.add,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// SwiGLU activation: `gate = silu(gate) * up`.
@@ -989,14 +1200,29 @@ impl CudaCtx {
             &mut u as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.swiglu, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.swiglu,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// GELU in place over `n` f16 elements (vision/audio towers).
     pub fn gelu(&self, x: u64, n: usize) -> Res<()> {
         let (mut xa, mut na) = (x, n as c_int);
-        let mut args = [&mut xa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
-        self.launch(self.funcs.gelu, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        let mut args = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        self.launch(
+            self.funcs.gelu,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Broadcast bias add over `rows` rows of width `n`.
@@ -1009,16 +1235,41 @@ impl CudaCtx {
             &mut r as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.bias, ((total as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.bias,
+            ((total as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Apply rotary position embeddings in place over `[rows, heads, dim]`.
     /// Rotary embedding in place over `[rows, heads*dim]`. `nfreqs` is the
     /// number of nonzero rotary frequencies (`dim/2` for classic RoPE; fewer
     /// for Gemma4 "proportional" RoPE, where the remaining pairs pass through).
-    pub fn rope(&self, x: u64, rows: usize, heads: usize, dim: usize, pos0: usize, theta: f32, nfreqs: usize, pos_dev: u64, factors: u64) -> Res<()> {
-        let (mut xa, mut ha, mut da, mut pa, mut ta, mut fa, mut pd, mut fc) =
-            (x, heads as c_int, dim as c_int, pos0 as c_int, theta, nfreqs as c_int, pos_dev, factors);
+    pub fn rope(
+        &self,
+        x: u64,
+        rows: usize,
+        heads: usize,
+        dim: usize,
+        pos0: usize,
+        theta: f32,
+        nfreqs: usize,
+        pos_dev: u64,
+        factors: u64,
+    ) -> Res<()> {
+        let (mut xa, mut ha, mut da, mut pa, mut ta, mut fa, mut pd, mut fc) = (
+            x,
+            heads as c_int,
+            dim as c_int,
+            pos0 as c_int,
+            theta,
+            nfreqs as c_int,
+            pos_dev,
+            factors,
+        );
         let mut args = [
             &mut xa as *mut _ as *mut c_void,
             &mut ha as *mut _ as *mut c_void,
@@ -1029,14 +1280,36 @@ impl CudaCtx {
             &mut pd as *mut _ as *mut c_void,
             &mut fc as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.rope, (rows as u32, heads as u32, 1), ((dim / 2) as u32).max(32), 0, &mut args)
+        self.launch(
+            self.funcs.rope,
+            (rows as u32, heads as u32, 1),
+            ((dim / 2) as u32).max(32),
+            0,
+            &mut args,
+        )
     }
 
-
     /// Append `rows` K/V rows into the layer cache at absolute position `pos`.
-    pub fn kv_append(&self, k: u64, v: u64, kc: u64, vc: u64, rows: usize, kv_heads: usize, dim: usize, pos: usize, max_seq: usize, pos_dev: u64) -> Res<()> {
+    pub fn kv_append(
+        &self,
+        k: u64,
+        v: u64,
+        kc: u64,
+        vc: u64,
+        rows: usize,
+        kv_heads: usize,
+        dim: usize,
+        pos: usize,
+        max_seq: usize,
+        pos_dev: u64,
+    ) -> Res<()> {
         let (mut ka, mut va, mut kca, mut vca, mut pd) = (k, v, kc, vc, pos_dev);
-        let (mut h, mut d, mut p, mut m) = (kv_heads as c_int, dim as c_int, pos as c_int, max_seq as c_int);
+        let (mut h, mut d, mut p, mut m) = (
+            kv_heads as c_int,
+            dim as c_int,
+            pos as c_int,
+            max_seq as c_int,
+        );
         let mut args = [
             &mut ka as *mut _ as *mut c_void,
             &mut va as *mut _ as *mut c_void,
@@ -1054,58 +1327,134 @@ impl CudaCtx {
     /// Warp-per-row decode GEMV with fused epilogues (see kernels.cu).
     /// `bias` 0 = none. Modes: 0 plain, 1 `y[row] += dot`, 2 silu(gate)·up
     /// over a row-concatenated gate|up matrix (`n` = intermediate size).
-    pub fn gemv_f16(&self, w: u64, x: u64, y: u64, bias: u64, n: usize, k: usize, mode: i32) -> Res<()> {
+    pub fn gemv_f16(
+        &self,
+        w: u64,
+        x: u64,
+        y: u64,
+        bias: u64,
+        n: usize,
+        k: usize,
+        mode: i32,
+    ) -> Res<()> {
         debug_assert!(k % 2 == 0, "half2 loads require even k");
         let (mut wa, mut xa, mut ya, mut ba) = (w, x, y, bias);
         let (mut na, mut ka, mut ma) = (n as c_int, k as c_int, mode as c_int);
         let mut args = [
-            &mut wa as *mut _ as *mut c_void, &mut xa as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void, &mut ba as *mut _ as *mut c_void,
-            &mut na as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
+            &mut wa as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut ba as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void,
             &mut ma as *mut _ as *mut c_void,
         ];
         const WARPS: usize = 4;
-        let blocks = ((n + WARPS - 1) / WARPS) as u32;
-        self.launch(self.funcs.gemv_f16, (blocks, 1, 1), (WARPS * 32) as u32, 0, &mut args)
+        let blocks = n.div_ceil(WARPS) as u32;
+        self.launch(
+            self.funcs.gemv_f16,
+            (blocks, 1, 1),
+            (WARPS * 32) as u32,
+            0,
+            &mut args,
+        )
     }
 
     /// Flash-decode pair: per-(head, chunk) partial attention + per-head
     /// log-sum-exp reduction. The grid covers max_seq, so a captured graph
     /// replays at any live length (`pos_dev` gates active chunks).
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_decode_split(&self, q: u64, kc: u64, vc: u64, part: u64, q_heads: usize, kv_heads: usize,
-        dim: usize, seq: usize, max_seq: usize, csz: usize, n_chunks: usize, scale: f32, window: usize, pos_dev: u64) -> Res<()> {
+    pub fn attn_decode_split(
+        &self,
+        q: u64,
+        kc: u64,
+        vc: u64,
+        part: u64,
+        q_heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        seq: usize,
+        max_seq: usize,
+        csz: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        pos_dev: u64,
+    ) -> Res<()> {
         let (mut qa, mut ka, mut va, mut pa) = (q, kc, vc, part);
         let (mut qh, mut kh, mut d) = (q_heads as c_int, kv_heads as c_int, dim as c_int);
         let (mut s, mut ms) = (seq as c_int, max_seq as c_int);
-        let (mut cs, mut nc, mut sc, mut wi, mut pd) = (csz as c_int, n_chunks as c_int, scale, window as c_int, pos_dev);
+        let (mut cs, mut nc, mut sc, mut wi, mut pd) = (
+            csz as c_int,
+            n_chunks as c_int,
+            scale,
+            window as c_int,
+            pos_dev,
+        );
         let mut args = [
-            &mut qa as *mut _ as *mut c_void, &mut ka as *mut _ as *mut c_void,
-            &mut va as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void,
-            &mut qh as *mut _ as *mut c_void, &mut kh as *mut _ as *mut c_void,
-            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
-            &mut ms as *mut _ as *mut c_void, &mut cs as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
-            &mut wi as *mut _ as *mut c_void, &mut pd as *mut _ as *mut c_void,
+            &mut qa as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut qh as *mut _ as *mut c_void,
+            &mut kh as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut wi as *mut _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
         ];
-        debug_assert!(dim % 32 == 0 && dim <= 256, "warp-register accumulator bounds");
+        debug_assert!(
+            dim % 32 == 0 && dim <= 256,
+            "warp-register accumulator bounds"
+        );
         let threads = 128u32; // 4 warps striding the chunk's positions
         let shmem = (4 * (dim + 2) * 4) as u32;
-        self.launch(self.funcs.attn_decode_split, ((q_heads * n_chunks) as u32, 1, 1), threads, shmem, &mut args)
+        self.launch(
+            self.funcs.attn_decode_split,
+            ((q_heads * n_chunks) as u32, 1, 1),
+            threads,
+            shmem,
+            &mut args,
+        )
     }
 
-    pub fn attn_reduce(&self, part: u64, out: u64, q_heads: usize, dim: usize, csz: usize,
-        n_chunks: usize, seq: usize, window: usize, pos_dev: u64) -> Res<()> {
+    pub fn attn_reduce(
+        &self,
+        part: u64,
+        out: u64,
+        q_heads: usize,
+        dim: usize,
+        csz: usize,
+        n_chunks: usize,
+        seq: usize,
+        window: usize,
+        pos_dev: u64,
+    ) -> Res<()> {
         let (mut pa, mut oa) = (part, out);
-        let (mut d, mut cs, mut nc, mut s) = (dim as c_int, csz as c_int, n_chunks as c_int, seq as c_int);
+        let (mut d, mut cs, mut nc, mut s) =
+            (dim as c_int, csz as c_int, n_chunks as c_int, seq as c_int);
         let (mut wi, mut pd) = (window as c_int, pos_dev);
         let mut args = [
-            &mut pa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
-            &mut d as *mut _ as *mut c_void, &mut cs as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
-            &mut wi as *mut _ as *mut c_void, &mut pd as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut wi as *mut _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.attn_reduce, (q_heads as u32, 1, 1), 64, (dim * 4) as u32, &mut args)
+        self.launch(
+            self.funcs.attn_reduce,
+            (q_heads as u32, 1, 1),
+            64,
+            (dim * 4) as u32,
+            &mut args,
+        )
     }
 
     /// Fused single-token attention over the KV cache (decode path).
@@ -1113,12 +1462,33 @@ impl CudaCtx {
     // head/dim/seq/scale/window geometry); a params struct would only add
     // marshalling on a hot launch path.
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_decode(&self, q: u64, kc: u64, vc: u64, out: u64, q_heads: usize, kv_heads: usize, dim: usize, seq: usize, max_seq: usize, scale: f32, window: usize, pos_dev: u64) -> Res<()> {
+    pub fn attn_decode(
+        &self,
+        q: u64,
+        kc: u64,
+        vc: u64,
+        out: u64,
+        q_heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        seq: usize,
+        max_seq: usize,
+        scale: f32,
+        window: usize,
+        pos_dev: u64,
+    ) -> Res<()> {
         let block = 128u32;
         let shmem = (block as usize + dim) * 4;
         let (mut qa, mut ka, mut va, mut oa, mut pd) = (q, kc, vc, out, pos_dev);
-        let (mut qh, mut kh, mut da, mut sa, mut ma, mut sc, mut wi) =
-            (q_heads as c_int, kv_heads as c_int, dim as c_int, seq as c_int, max_seq as c_int, scale, window as c_int);
+        let (mut qh, mut kh, mut da, mut sa, mut ma, mut sc, mut wi) = (
+            q_heads as c_int,
+            kv_heads as c_int,
+            dim as c_int,
+            seq as c_int,
+            max_seq as c_int,
+            scale,
+            window as c_int,
+        );
         let mut args = [
             &mut qa as *mut _ as *mut c_void,
             &mut ka as *mut _ as *mut c_void,
@@ -1133,19 +1503,47 @@ impl CudaCtx {
             &mut wi as *mut _ as *mut c_void,
             &mut pd as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.attn_decode, (q_heads as u32, 1, 1), block, shmem as u32, &mut args)
+        self.launch(
+            self.funcs.attn_decode,
+            (q_heads as u32, 1, 1),
+            block,
+            shmem as u32,
+            &mut args,
+        )
     }
-
 
     /// Causal prefill attention for `rows` new tokens starting at `pos0`.
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_prefill(&self, q: u64, kc: u64, vc: u64, out: u64, rows: usize, q_heads: usize, kv_heads: usize, dim: usize, pos0: usize, max_seq: usize, causal: bool, scale: f32, window: usize, blkid: u64) -> Res<()> {
+    pub fn attn_prefill(
+        &self,
+        q: u64,
+        kc: u64,
+        vc: u64,
+        out: u64,
+        rows: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        pos0: usize,
+        max_seq: usize,
+        causal: bool,
+        scale: f32,
+        window: usize,
+        blkid: u64,
+    ) -> Res<()> {
         let block = 128u32;
         let shmem = (block as usize + dim) * 4;
         let (mut qa, mut ka, mut va, mut oa, mut ba) = (q, kc, vc, out, blkid);
         let (mut qh, mut kh, mut da, mut pa, mut ma, mut na, mut ca, mut sc, mut wi) = (
-            q_heads as c_int, kv_heads as c_int, dim as c_int, pos0 as c_int, max_seq as c_int,
-            rows as c_int, causal as c_int, scale, window as c_int,
+            q_heads as c_int,
+            kv_heads as c_int,
+            dim as c_int,
+            pos0 as c_int,
+            max_seq as c_int,
+            rows as c_int,
+            causal as c_int,
+            scale,
+            window as c_int,
         );
         let mut args = [
             &mut qa as *mut _ as *mut c_void,
@@ -1163,13 +1561,29 @@ impl CudaCtx {
             &mut wi as *mut _ as *mut c_void,
             &mut ba as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.attn_prefill, (rows as u32, q_heads as u32, 1), block, shmem as u32, &mut args)
+        self.launch(
+            self.funcs.attn_prefill,
+            (rows as u32, q_heads as u32, 1),
+            block,
+            shmem as u32,
+            &mut args,
+        )
     }
 
     /// 2-D rotary embedding for the Gemma4 vision tower: first half of each
     /// head rotates with the patch x-coordinate, second half with y.
-    pub fn rope2d(&self, x: u64, posx: u64, posy: u64, rows: usize, heads: usize, dim: usize, theta: f32) -> Res<()> {
-        let (mut xa, mut pxa, mut pya, mut ha, mut da, mut ta) = (x, posx, posy, heads as c_int, dim as c_int, theta);
+    pub fn rope2d(
+        &self,
+        x: u64,
+        posx: u64,
+        posy: u64,
+        rows: usize,
+        heads: usize,
+        dim: usize,
+        theta: f32,
+    ) -> Res<()> {
+        let (mut xa, mut pxa, mut pya, mut ha, mut da, mut ta) =
+            (x, posx, posy, heads as c_int, dim as c_int, theta);
         let mut args = [
             &mut xa as *mut _ as *mut c_void,
             &mut pxa as *mut _ as *mut c_void,
@@ -1178,28 +1592,62 @@ impl CudaCtx {
             &mut da as *mut _ as *mut c_void,
             &mut ta as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.rope2d, (rows as u32, heads as u32, 1), ((dim / 2) as u32).max(32), 0, &mut args)
+        self.launch(
+            self.funcs.rope2d,
+            (rows as u32, heads as u32, 1),
+            ((dim / 2) as u32).max(32),
+            0,
+            &mut args,
+        )
     }
 
     /// GeGLU in place over `gate`: `gate = gelu_tanh(gate) * up`.
     pub fn geglu(&self, gate: u64, up: u64, n: usize) -> Res<()> {
         let (mut g, mut u, mut na) = (gate, up, n as c_int);
-        let mut args = [&mut g as *mut _ as *mut c_void, &mut u as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
-        self.launch(self.funcs.geglu, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        let mut args = [
+            &mut g as *mut _ as *mut c_void,
+            &mut u as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        self.launch(
+            self.funcs.geglu,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// SiLU in place.
     pub fn silu(&self, x: u64, n: usize) -> Res<()> {
         let (mut xa, mut na) = (x, n as c_int);
-        let mut args = [&mut xa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
-        self.launch(self.funcs.silu, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        let mut args = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        self.launch(
+            self.funcs.silu,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// ReLU in place.
     pub fn relu(&self, x: u64, n: usize) -> Res<()> {
         let (mut xa, mut na) = (x, n as c_int);
-        let mut args = [&mut xa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
-        self.launch(self.funcs.relu, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        let mut args = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        self.launch(
+            self.funcs.relu,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// GLU: `y[r, :n] = x[r, :n] * sigmoid(x[r, n:2n])`.
@@ -1211,14 +1659,30 @@ impl CudaCtx {
             &mut ra as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.glu, (((rows * n) as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.glu,
+            (((rows * n) as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Scalar multiply in place: `x *= s`.
     pub fn scalemul(&self, x: u64, s: f32, n: usize) -> Res<()> {
         let (mut xa, mut sa, mut na) = (x, s, n as c_int);
-        let mut args = [&mut xa as *mut _ as *mut c_void, &mut sa as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void];
-        self.launch(self.funcs.scalemul, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        let mut args = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+        ];
+        self.launch(
+            self.funcs.scalemul,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Per-channel vector multiply: `x[r, c] *= s[c]`.
@@ -1230,13 +1694,33 @@ impl CudaCtx {
             &mut ra as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.mulvec, (((rows * n) as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.mulvec,
+            (((rows * n) as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Strided multiply: `a[r, c] *= b[r*stride + off + c]` (PLE gating).
-    pub fn mul_strided(&self, a: u64, b: u64, rows: usize, n: usize, stride: usize, off: usize) -> Res<()> {
-        let (mut aa, mut ba, mut ra, mut na, mut st, mut of) =
-            (a, b, rows as c_int, n as c_int, stride as c_int, off as c_int);
+    pub fn mul_strided(
+        &self,
+        a: u64,
+        b: u64,
+        rows: usize,
+        n: usize,
+        stride: usize,
+        off: usize,
+    ) -> Res<()> {
+        let (mut aa, mut ba, mut ra, mut na, mut st, mut of) = (
+            a,
+            b,
+            rows as c_int,
+            n as c_int,
+            stride as c_int,
+            off as c_int,
+        );
         let mut args = [
             &mut aa as *mut _ as *mut c_void,
             &mut ba as *mut _ as *mut c_void,
@@ -1245,7 +1729,13 @@ impl CudaCtx {
             &mut st as *mut _ as *mut c_void,
             &mut of as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.mul_strided, (((rows * n) as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.mul_strided,
+            (((rows * n) as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Clamp in place: `x = clamp(x, lo, hi)`.
@@ -1257,12 +1747,19 @@ impl CudaCtx {
             &mut ha as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.clamp, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.clamp,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Causal depthwise conv1d: `x,y [seq, C]`, `w [C, K]`.
     pub fn dwconv1d(&self, x: u64, w: u64, y: u64, seq: usize, c: usize, k: usize) -> Res<()> {
-        let (mut xa, mut wa, mut ya, mut sa, mut ca, mut ka) = (x, w, y, seq as c_int, c as c_int, k as c_int);
+        let (mut xa, mut wa, mut ya, mut sa, mut ca, mut ka) =
+            (x, w, y, seq as c_int, c as c_int, k as c_int);
         let mut args = [
             &mut xa as *mut _ as *mut c_void,
             &mut wa as *mut _ as *mut c_void,
@@ -1271,17 +1768,44 @@ impl CudaCtx {
             &mut ca as *mut _ as *mut c_void,
             &mut ka as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.dwconv1d, (((seq * c) as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.dwconv1d,
+            (((seq * c) as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Fused Gemma4 audio attention (chunked local + relative bias + tanh cap).
     #[allow(clippy::too_many_arguments)]
-    pub fn audio_attn(&self, q: u64, k: u64, v: u64, relk: u64, out: u64, seq: usize, heads: usize, dim: usize, chunk: usize, past: usize, cap: f32, invalid: f32) -> Res<()> {
+    pub fn audio_attn(
+        &self,
+        q: u64,
+        k: u64,
+        v: u64,
+        relk: u64,
+        out: u64,
+        seq: usize,
+        heads: usize,
+        dim: usize,
+        chunk: usize,
+        past: usize,
+        cap: f32,
+        invalid: f32,
+    ) -> Res<()> {
         let block = 64u32;
         let shmem = (block as usize + dim) * 4;
         let (mut qa, mut ka, mut va, mut ra, mut oa) = (q, k, v, relk, out);
-        let (mut sa, mut ha, mut da, mut ca, mut pa, mut cp, mut inv) =
-            (seq as c_int, heads as c_int, dim as c_int, chunk as c_int, past as c_int, cap, invalid);
+        let (mut sa, mut ha, mut da, mut ca, mut pa, mut cp, mut inv) = (
+            seq as c_int,
+            heads as c_int,
+            dim as c_int,
+            chunk as c_int,
+            past as c_int,
+            cap,
+            invalid,
+        );
         let mut args = [
             &mut qa as *mut _ as *mut c_void,
             &mut ka as *mut _ as *mut c_void,
@@ -1296,7 +1820,13 @@ impl CudaCtx {
             &mut cp as *mut _ as *mut c_void,
             &mut inv as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.audio_attn, (seq as u32, heads as u32, 1), block, shmem as u32, &mut args)
+        self.launch(
+            self.funcs.audio_attn,
+            (seq as u32, heads as u32, 1),
+            block,
+            shmem as u32,
+            &mut args,
+        )
     }
 
     /// Begin an asynchronous 8-byte fetch of the argmax slot: enqueues the
@@ -1309,7 +1839,10 @@ impl CudaCtx {
             unsafe { cuMemcpyDtoHAsync_v2(fetch.host, slot.ptr, 8, self.stream) },
             "cuMemcpyDtoHAsync",
         )?;
-        cu_check(unsafe { cuEventRecord(fetch.event, self.stream) }, "cuEventRecord")
+        cu_check(
+            unsafe { cuEventRecord(fetch.event, self.stream) },
+            "cuEventRecord",
+        )
     }
 
     /// Pinned 8-byte landing slot + completion event for [`fetch_token_async`].
@@ -1326,7 +1859,13 @@ impl CudaCtx {
     /// logits row never crosses PCIe). `slot` is any 8-byte device scratch.
     /// Enqueue cap+argmax into `slot` (no readback — compose with
     /// [`Self::argmax_to_ids`] and/or [`Self::fetch_token_async`]).
-    pub fn argmax_softcap_enqueue(&self, logits_h: u64, slot: &DeviceBuf, n: usize, cap: f32) -> Res<()> {
+    pub fn argmax_softcap_enqueue(
+        &self,
+        logits_h: u64,
+        slot: &DeviceBuf,
+        n: usize,
+        cap: f32,
+    ) -> Res<()> {
         self.memset(slot)?;
         let (mut xa, mut oa) = (logits_h, slot.ptr);
         let (mut na, mut ca) = (n as c_int, cap);
@@ -1336,7 +1875,7 @@ impl CudaCtx {
             &mut na as *mut _ as *mut c_void,
             &mut ca as *mut _ as *mut c_void,
         ];
-        let blocks = (((n + 255) / 256).min(1024)) as u32;
+        let blocks = (n.div_ceil(256).min(1024)) as u32;
         self.launch(self.funcs.argmax_softcap, (blocks, 1, 1), 256, 0, &mut args)
     }
 
@@ -1344,7 +1883,10 @@ impl CudaCtx {
     /// next step's embedding gather without a host round-trip.
     pub fn argmax_to_ids(&self, slot: &DeviceBuf, ids: &DeviceBuf) -> Res<()> {
         let (mut sa, mut ia) = (slot.ptr, ids.ptr);
-        let mut args = [&mut sa as *mut _ as *mut c_void, &mut ia as *mut _ as *mut c_void];
+        let mut args = [
+            &mut sa as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void,
+        ];
         self.launch(self.funcs.argmax_extract, (1, 1, 1), 32, 0, &mut args)
     }
 
@@ -1360,22 +1902,39 @@ impl CudaCtx {
     pub fn apply_penalty(&self, logits: u64, counts: u64, rp: f32, n: usize) -> Res<()> {
         let (mut xa, mut ca, mut ra, mut na) = (logits, counts, rp, n as c_int);
         let mut args = [
-            &mut xa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
-            &mut ra as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void,
+            &mut ca as *mut _ as *mut c_void,
+            &mut ra as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.apply_penalty, (((n + 255) / 256) as u32, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.apply_penalty,
+            (n.div_ceil(256) as u32, 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Enqueue extraction of the top-`k` candidates in descending order:
     /// `k` rounds of (cap+argmax into `slot`, record into `cands[j]`, mask
     /// the winner). All nodes are graph-capturable; `cands` ends holding
     /// `k` packed (orderable-bits, index) pairs — see [`unpack_candidate`].
-    pub fn topk_enqueue(&self, logits: u64, slot: &DeviceBuf, cands: u64, n: usize, cap: f32, k: usize) -> Res<()> {
+    pub fn topk_enqueue(
+        &self,
+        logits: u64,
+        slot: &DeviceBuf,
+        cands: u64,
+        n: usize,
+        cap: f32,
+        k: usize,
+    ) -> Res<()> {
         for j in 0..k {
             self.argmax_softcap_enqueue(logits, slot, n, cap)?;
             let (mut sa, mut oa, mut xa) = (slot.ptr, cands + (j * 8) as u64, logits);
             let mut args = [
-                &mut sa as *mut _ as *mut c_void, &mut oa as *mut _ as *mut c_void,
+                &mut sa as *mut _ as *mut c_void,
+                &mut oa as *mut _ as *mut c_void,
                 &mut xa as *mut _ as *mut c_void,
             ];
             self.launch(self.funcs.slot_take, (1, 1, 1), 32, 0, &mut args)?;
@@ -1389,8 +1948,10 @@ impl CudaCtx {
         let (mut ra, mut ca, mut ia) = (ring, counts, ids);
         let (mut ix, mut pd) = (idx as c_int, pos_dev);
         let mut args = [
-            &mut ra as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
-            &mut ia as *mut _ as *mut c_void, &mut ix as *mut _ as *mut c_void,
+            &mut ra as *mut _ as *mut c_void,
+            &mut ca as *mut _ as *mut c_void,
+            &mut ia as *mut _ as *mut c_void,
+            &mut ix as *mut _ as *mut c_void,
             &mut pd as *mut _ as *mut c_void,
         ];
         self.launch(self.funcs.hist_push, (1, 1, 1), 32, 0, &mut args)
@@ -1423,7 +1984,17 @@ impl CudaCtx {
         Ok(g.as_ref().unwrap().ptr)
     }
 
-    pub fn gguf_gemv(&self, fmt: crate::traits::DType, x: u64, w: u64, bias: u64, y: u64, n: usize, k: usize, mode: i32) -> Res<()> {
+    pub fn gguf_gemv(
+        &self,
+        fmt: crate::traits::DType,
+        x: u64,
+        w: u64,
+        bias: u64,
+        y: u64,
+        n: usize,
+        k: usize,
+        mode: i32,
+    ) -> Res<()> {
         use crate::traits::DType as D;
         let f = match fmt {
             D::GgufQ8_0 => self.funcs.gguf_q8_0_gemv,
@@ -1435,7 +2006,13 @@ impl CudaCtx {
             D::GgufQ5K => self.funcs.gguf_q5_k_gemv,
             D::GgufQ6K => self.funcs.gguf_q6_k_gemv,
             D::GgufIQ4XS => self.funcs.gguf_iq4_xs_gemv,
-            other => return Err(err!("cuda", "gguf_gemv: {:?} is not a gguf block format", other)),
+            other => {
+                return Err(err!(
+                    "cuda",
+                    "gguf_gemv: {:?} is not a gguf block format",
+                    other
+                ))
+            }
         };
         let nb = k / 32;
         let xq = self.ensure_q8_scratch(k)?;
@@ -1446,7 +2023,13 @@ impl CudaCtx {
                 &mut qa as *mut _ as *mut c_void,
                 &mut ka as *mut _ as *mut c_void,
             ];
-            self.launch(self.funcs.quantize_q8_1, (nb as u32, 1, 1), 32, 0, &mut args)?;
+            self.launch(
+                self.funcs.quantize_q8_1,
+                (nb as u32, 1, 1),
+                32,
+                0,
+                &mut args,
+            )?;
         }
         let (mut xa, mut wa, mut ba, mut ya, mut na, mut ka, mut ma) =
             (xq, w, bias, y, n as c_int, k as c_int, mode as c_int);
@@ -1459,14 +2042,22 @@ impl CudaCtx {
             &mut ka as *mut _ as *mut c_void,
             &mut ma as *mut _ as *mut c_void,
         ];
-        self.launch(f, ((n as u32 + 7) / 8, 1, 1), 256, 0, &mut args)
+        self.launch(f, ((n as u32).div_ceil(8), 1, 1), 256, 0, &mut args)
     }
 
     /// Embedding gather straight from a packed GGUF table    /// Embedding gather straight from a packed GGUF table    /// Embedding gather straight from a packed GGUF table    /// Embedding gather straight from a packed GGUF table: `out[i] =
     /// dequant(table[ids[i]])`, one thread per output element. `fmt` rides
     /// as the ggml type id so a single kernel serves every block format
     /// (uniform branch — no divergence).
-    pub fn gguf_gather(&self, fmt: crate::traits::DType, table: u64, ids: u64, out: u64, n: usize, hidden: usize) -> Res<()> {
+    pub fn gguf_gather(
+        &self,
+        fmt: crate::traits::DType,
+        table: u64,
+        ids: u64,
+        out: u64,
+        n: usize,
+        hidden: usize,
+    ) -> Res<()> {
         use crate::traits::DType as D;
         let (id, row_bytes): (i32, usize) = match fmt {
             D::GgufQ8_0 => (8, hidden / 32 * 34),
@@ -1478,11 +2069,24 @@ impl CudaCtx {
             D::GgufQ5K => (13, hidden / 256 * 176),
             D::GgufQ6K => (14, hidden / 256 * 210),
             D::GgufIQ4XS => (23, hidden / 256 * 136),
-            other => return Err(err!("cuda", "gguf_gather: {:?} is not a gguf block format", other)),
+            other => {
+                return Err(err!(
+                    "cuda",
+                    "gguf_gather: {:?} is not a gguf block format",
+                    other
+                ))
+            }
         };
         let elems = n * hidden;
-        let (mut ta, mut ia, mut oa, mut na, mut ha, mut fa, mut ra) =
-            (table, ids, out, n as c_int, hidden as c_int, id as c_int, row_bytes as c_int);
+        let (mut ta, mut ia, mut oa, mut na, mut ha, mut fa, mut ra) = (
+            table,
+            ids,
+            out,
+            n as c_int,
+            hidden as c_int,
+            id as c_int,
+            row_bytes as c_int,
+        );
         let mut args = [
             &mut ta as *mut _ as *mut c_void,
             &mut ia as *mut _ as *mut c_void,
@@ -1492,13 +2096,25 @@ impl CudaCtx {
             &mut fa as *mut _ as *mut c_void,
             &mut ra as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.gguf_gather, ((elems as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.gguf_gather,
+            ((elems as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// GGUF block dequantization to f16 on device — `fmt` selects the
     /// codec (bit-exact mirrors of `quant::gguf`'s host decoders; one
     /// thread per super-block).
-    pub fn gguf_dequant(&self, fmt: crate::traits::DType, src: u64, out: u64, nblocks: usize) -> Res<()> {
+    pub fn gguf_dequant(
+        &self,
+        fmt: crate::traits::DType,
+        src: u64,
+        out: u64,
+        nblocks: usize,
+    ) -> Res<()> {
         use crate::traits::DType as D;
         let f = match fmt {
             D::GgufQ8_0 => self.funcs.gguf_q8_0,
@@ -1510,7 +2126,13 @@ impl CudaCtx {
             D::GgufQ5K => self.funcs.gguf_q5_k,
             D::GgufQ6K => self.funcs.gguf_q6_k,
             D::GgufIQ4XS => self.funcs.gguf_iq4_xs,
-            other => return Err(err!("cuda", "gguf_dequant: {:?} is not a gguf block format", other)),
+            other => {
+                return Err(err!(
+                    "cuda",
+                    "gguf_dequant: {:?} is not a gguf block format",
+                    other
+                ))
+            }
         };
         let elems = nblocks * crate::traits::block_elems(fmt);
         let (mut sa, mut oa, mut na) = (src, out, nblocks as c_int);
@@ -1519,10 +2141,18 @@ impl CudaCtx {
             &mut oa as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(f, ((elems as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(f, ((elems as u32).div_ceil(256), 1, 1), 256, 0, &mut args)
     }
 
-    pub fn nf4_dequant(&self, packed: u64, absmax: u64, qmap: u64, out: u64, n: usize, blocksize: usize) -> Res<()> {
+    pub fn nf4_dequant(
+        &self,
+        packed: u64,
+        absmax: u64,
+        qmap: u64,
+        out: u64,
+        n: usize,
+        blocksize: usize,
+    ) -> Res<()> {
         let (mut pa, mut aa, mut qa, mut oa, mut na, mut ba) =
             (packed, absmax, qmap, out, n as c_int, blocksize as c_int);
         let mut args = [
@@ -1533,30 +2163,55 @@ impl CudaCtx {
             &mut na as *mut _ as *mut c_void,
             &mut ba as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.nf4_dequant, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.nf4_dequant,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Fused single-row GEMV over a packed NF4/FP4 weight (decode path).
     #[allow(clippy::too_many_arguments)]
-    pub fn nf4_gemv(&self, x: u64, packed: u64, absmax: u64, qmap: u64, y: u64, n: usize, k: usize, blocksize: usize) -> Res<()> {
+    pub fn nf4_gemv(
+        &self,
+        x: u64,
+        packed: u64,
+        absmax: u64,
+        qmap: u64,
+        y: u64,
+        n: usize,
+        k: usize,
+        blocksize: usize,
+    ) -> Res<()> {
         let (mut xa, mut pa, mut aa, mut qa, mut ya) = (x, packed, absmax, qmap, y);
         let (mut na, mut ka, mut ba) = (n as c_int, k as c_int, blocksize as c_int);
         let mut args = [
-            &mut xa as *mut _ as *mut c_void, &mut pa as *mut _ as *mut c_void,
-            &mut aa as *mut _ as *mut c_void, &mut qa as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void, &mut na as *mut _ as *mut c_void,
-            &mut ka as *mut _ as *mut c_void, &mut ba as *mut _ as *mut c_void,
+            &mut xa as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut qa as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void,
+            &mut ba as *mut _ as *mut c_void,
         ];
         if k % 8 == 0 && blocksize % 8 == 0 {
             // Warp-per-row fast path (4 warps per block).
-            let blocks = ((n + 3) / 4) as u32;
+            let blocks = n.div_ceil(4) as u32;
             self.launch(self.funcs.nf4_gemv, (blocks, 1, 1), 128, 0, &mut args)
         } else {
             let block = 256u32;
-            self.launch(self.funcs.nf4_gemv_ref, (n as u32, 1, 1), block, block * 4, &mut args)
+            self.launch(
+                self.funcs.nf4_gemv_ref,
+                (n as u32, 1, 1),
+                block,
+                block * 4,
+                &mut args,
+            )
         }
     }
-
 
     /// f16 -> f32 device copy.
     pub fn h2f(&self, x: u64, y: u64, n: usize) -> Res<()> {
@@ -1566,7 +2221,13 @@ impl CudaCtx {
             &mut ya as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.h2f, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.h2f,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// f32 -> f16 device copy.
@@ -1577,7 +2238,13 @@ impl CudaCtx {
             &mut ya as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.f2h, ((n as u32 + 255) / 256, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.f2h,
+            ((n as u32).div_ceil(256), 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// bf16 -> f16 device conversion (weight normalization at load time).
@@ -1588,7 +2255,13 @@ impl CudaCtx {
             &mut ya as *mut _ as *mut c_void,
             &mut na as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.bf2h, (((n + 255) / 256) as u32, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.bf2h,
+            (n.div_ceil(256) as u32, 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     /// Mean-pool `[rows, hidden]` f16 into `hidden` f32 values.
@@ -1600,7 +2273,13 @@ impl CudaCtx {
             &mut r as *mut _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
         ];
-        self.launch(self.funcs.meanpool, (((hidden + 255) / 256) as u32, 1, 1), 256, 0, &mut args)
+        self.launch(
+            self.funcs.meanpool,
+            (hidden.div_ceil(256) as u32, 1, 1),
+            256,
+            0,
+            &mut args,
+        )
     }
 
     // ------------------------------------------------------------------ GEMM
@@ -1612,16 +2291,35 @@ impl CudaCtx {
     /// C_full is [m, ldn] and this call fills columns [0..n) starting at
     /// the pointer (caller offsets to the slab's first column). Same
     /// transpose trick; only ldc changes.
-    pub fn gemm_strided_out(&self, a: u64, b: u64, c: u64, m: usize, n: usize, k: usize, ldn: usize) -> Res<()> {
+    pub fn gemm_strided_out(
+        &self,
+        a: u64,
+        b: u64,
+        c: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+        ldn: usize,
+    ) -> Res<()> {
         self.gemm_dispatch(a, b, c, m, n, k, ldn)
     }
 
     /// One dispatcher for both public GEMMs: cuBLAS when dlopened, the
     /// native tiled kernel otherwise. `ldc` is C's row stride in elements
     /// (== n for the plain call, wider for the column-range variant).
-    fn gemm_dispatch(&self, a: u64, b: u64, c: u64, m: usize, n: usize, k: usize, ldc: usize) -> Res<()> {
+    fn gemm_dispatch(
+        &self,
+        a: u64,
+        b: u64,
+        c: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+        ldc: usize,
+    ) -> Res<()> {
         record_op(format!("gemm(m={},n={},k={})", m, n, k));
-        self.launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.launches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(blas) = &self.blas {
             let alpha: f32 = 1.0;
             let beta: f32 = 0.0;
@@ -1631,18 +2329,36 @@ impl CudaCtx {
             let st = unsafe {
                 (blas.gemm_ex)(
                     blas.handle,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    n as c_int, m as c_int, k as c_int,
+                    CUBLAS_OP_T,
+                    CUBLAS_OP_N,
+                    n as c_int,
+                    m as c_int,
+                    k as c_int,
                     &alpha as *const f32 as *const c_void,
-                    b as *const c_void, CUDA_R_16F, k as c_int,
-                    a as *const c_void, CUDA_R_16F, k as c_int,
+                    b as *const c_void,
+                    CUDA_R_16F,
+                    k as c_int,
+                    a as *const c_void,
+                    CUDA_R_16F,
+                    k as c_int,
                     &beta as *const f32 as *const c_void,
-                    c as *mut c_void, CUDA_R_16F, ldc as c_int,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+                    c as *mut c_void,
+                    CUDA_R_16F,
+                    ldc as c_int,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT,
                 )
             };
             if st != 0 {
-                return Err(err!("cuda", "cublasGemmEx(m={},n={},k={},ldc={}) failed: status {}", m, n, k, ldc, st));
+                return Err(err!(
+                    "cuda",
+                    "cublasGemmEx(m={},n={},k={},ldc={}) failed: status {}",
+                    m,
+                    n,
+                    k,
+                    ldc,
+                    st
+                ));
             }
             return Ok(());
         }
@@ -1650,7 +2366,16 @@ impl CudaCtx {
     }
 
     /// The cuBLAS-free path (also directly testable by `selftest gemm`).
-    pub fn gemm_f16_native(&self, a: u64, b: u64, c: u64, m: usize, n: usize, k: usize, ldc: usize) -> Res<()> {
+    pub fn gemm_f16_native(
+        &self,
+        a: u64,
+        b: u64,
+        c: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+        ldc: usize,
+    ) -> Res<()> {
         let (mut m_, mut n_, mut k_, mut ldc_) = (m as c_int, n as c_int, k as c_int, ldc as c_int);
         let (mut ap, mut bp, mut cp) = (a, b, c);
         let mut args: [*mut c_void; 7] = [
@@ -1662,7 +2387,7 @@ impl CudaCtx {
             &mut k_ as *mut _ as *mut c_void,
             &mut ldc_ as *mut _ as *mut c_void,
         ];
-        let grid = (((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1);
+        let grid = (n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1);
         self.launch(self.funcs.gemm_f16, grid, 256, 0, &mut args)
     }
 
@@ -1714,18 +2439,31 @@ fn find_cuda_include() -> Res<std::path::PathBuf> {
          headers, not just the driver — install the toolkit (e.g. \
          `apt install nvidia-cuda-toolkit` or the NVIDIA .run/.deb package) \
          or point CUDA_HOME at its prefix, e.g. CUDA_HOME=/usr/local/cuda-12.4",
-        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
 /// Compile `src` for `sm_{maj}{min}`, caching PTX under `./models/.ptx-cache`.
 fn compile_ptx(src: &str, maj: i32, min: i32) -> Res<CString> {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in src.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
-    let cache = std::path::PathBuf::from(format!("./models/.ptx-cache/kernels_sm{}{}_{:016x}.ptx", maj, min, h));
+    for b in src.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let cache = std::path::PathBuf::from(format!(
+        "./models/.ptx-cache/kernels_sm{}{}_{:016x}.ptx",
+        maj, min, h
+    ));
     if let Ok(bytes) = std::fs::read(&cache) {
         if let Ok(c) = CString::new(bytes) {
-            log::info(&format!("kernel PTX loaded from cache: {}", cache.display()));
+            log::info(&format!(
+                "kernel PTX loaded from cache: {}",
+                cache.display()
+            ));
             return Ok(c);
         }
     }
@@ -1737,7 +2475,15 @@ fn compile_ptx(src: &str, maj: i32, min: i32) -> Res<CString> {
         let csrc = CString::new(src).unwrap();
         let cname = CString::new("cima_kernels.cu").unwrap();
         let mut prog: nvrtcProgram = ptr::null_mut();
-        if nvrtcCreateProgram(&mut prog, csrc.as_ptr(), cname.as_ptr(), 0, ptr::null(), ptr::null()) != 0 {
+        if nvrtcCreateProgram(
+            &mut prog,
+            csrc.as_ptr(),
+            cname.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        ) != 0
+        {
             return Err(err!("cuda", "nvrtcCreateProgram failed"));
         }
         let arch = CString::new(format!("--gpu-architecture=compute_{}{}", maj, min)).unwrap();
@@ -1766,11 +2512,18 @@ fn compile_ptx(src: &str, maj: i32, min: i32) -> Res<CString> {
         nvrtcGetPTX(prog, ptx.as_mut_ptr() as *mut c_char);
         nvrtcDestroyProgram(&mut prog);
         // PTX is NUL-terminated from NVRTC.
-        while ptx.last() == Some(&0) { ptx.pop(); }
+        while ptx.last() == Some(&0) {
+            ptx.pop();
+        }
 
         let _ = std::fs::create_dir_all(cache.parent().unwrap());
         let _ = std::fs::write(&cache, &ptx);
-        log::info(&format!("kernels JIT-compiled for sm_{}{} in {:?}", maj, min, t0.elapsed()));
+        log::info(&format!(
+            "kernels JIT-compiled for sm_{}{} in {:?}",
+            maj,
+            min,
+            t0.elapsed()
+        ));
         CString::new(ptx).map_err(|_| err!("cuda", "PTX contained interior NUL"))
     }
 }
