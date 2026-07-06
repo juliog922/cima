@@ -1490,11 +1490,7 @@ fn cmd_logs(rest: &[String]) -> Res<()> {
         let mut last = recs.last().map(|r| r.seq).unwrap_or(0);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let fresh: Vec<_> = ring
-                .read_since(last)
-                .into_iter()
-                .filter(&pass)
-                .collect();
+            let fresh: Vec<_> = ring.read_since(last).into_iter().filter(&pass).collect();
             for r in &fresh {
                 if table {
                     print_table(std::slice::from_ref(r));
