@@ -55,7 +55,7 @@ if [[ "${1:-}" != "--inner" ]]; then
   fi
   docker compose --profile tools build bench
   # scripts live under scripts/ relative to the /bench working_dir.
-  docker compose --profile tools run --rm bench scripts/test.sh --inner
+  docker compose --profile tools run --rm bench bash scripts/test.sh --inner
   exit $?
 fi
 

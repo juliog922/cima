@@ -1470,7 +1470,7 @@ fn cmd_logs(rest: &[String]) -> Res<()> {
         }
     }
 
-    let mut recs: Vec<_> = ring.read_since(0).into_iter().filter(|r| pass(r)).collect();
+    let mut recs: Vec<_> = ring.read_since(0).into_iter().filter(&pass).collect();
     if let Some(n) = last_n {
         let skip = recs.len().saturating_sub(n);
         recs.drain(..skip);
@@ -1493,7 +1493,7 @@ fn cmd_logs(rest: &[String]) -> Res<()> {
             let fresh: Vec<_> = ring
                 .read_since(last)
                 .into_iter()
-                .filter(|r| pass(r))
+                .filter(&pass)
                 .collect();
             for r in &fresh {
                 if table {
