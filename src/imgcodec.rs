@@ -399,7 +399,7 @@ pub fn decode_jpeg(b: &[u8]) -> R<(usize, usize, Vec<u8>)> {
                         return Err("jpeg: quant table id > 3".into());
                     }
                     o += 1;
-                    for z in 0..64 {
+                    for &zz in ZIGZAG.iter() {
                         let q = if prec == 0 {
                             let v = seg[o] as f32;
                             o += 1;
@@ -409,7 +409,7 @@ pub fn decode_jpeg(b: &[u8]) -> R<(usize, usize, Vec<u8>)> {
                             o += 2;
                             v
                         };
-                        qt[id][ZIGZAG[z]] = q;
+                        qt[id][zz] = q;
                     }
                 }
             }
@@ -616,7 +616,7 @@ struct ZBits<'a> {
     bit: u32,
 }
 
-impl<'a> ZBits<'a> {
+impl ZBits<'_> {
     fn take(&mut self, n: u32) -> R<u32> {
         let mut v = 0u32;
         for i in 0..n {

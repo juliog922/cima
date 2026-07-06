@@ -247,7 +247,7 @@ struct Parser<'a> {
     i: usize,
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     fn peek(&self) -> Option<u8> {
         self.b.get(self.i).copied()
     }
