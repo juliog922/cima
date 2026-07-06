@@ -1684,8 +1684,26 @@ mod selector_tests {
     use super::{list_local_caps, local_dir, split_selector};
 
     // Serialize the env-mutating tests in this module.
+    // Serialize model-dir tests: CIMA_MODELS_DIR is process-global, so
+    // parallel tests would otherwise clobber each other's fixtures (one
+    // test's remove_dir_all wipes another's freshly-written dir, and
+    // list_local_caps sees an empty tree). A mutex makes each body's
+    // set-var / populate / list / clean sequence atomic.
+    fn models_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn with_models_dir(f: impl FnOnce(&std::path::Path)) {
-        let base = std::env::temp_dir().join(format!("cima-ll-{}", std::process::id()));
+        let _guard = models_dir_lock();
+        let base = std::env::temp_dir().join(format!(
+            "cima-ll-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let prev = std::env::var("CIMA_MODELS_DIR").ok();

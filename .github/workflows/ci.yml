@@ -29,8 +29,19 @@ env:
 jobs:
   lint-and-test:
     runs-on: ubuntu-24.04
+    # Run inside the CUDA toolkit image: it provides the cuda/nvrtc/nvml
+    # stub libraries the crate links against (libcuda.so lives under
+    # lib64/stubs and is provided for real by the driver at runtime). Without
+    # this, `cargo test` fails to link on a bare runner (-lcuda not found).
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
     steps:
       - uses: actions/checkout@v4
+      - name: System deps (curl dev lib + build tooling)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            libcurl4-openssl-dev ca-certificates curl build-essential git pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.83"
