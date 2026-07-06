@@ -1,0 +1,2 @@
+engine,model,metric,value,unit
+cima,Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0,gen p50,261.1,tok/s n=20

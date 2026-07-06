@@ -467,10 +467,9 @@ pub mod bnb {
                 if state_name(inner.tensors(), &name).is_some() {
                     let st = parse_state(&*inner, &name)?;
                     let h = dequant_host(&*inner, &meta, &name)?;
-                    let bytes: Vec<u8> = unsafe {
-                        std::slice::from_raw_parts(h.as_ptr() as *const u8, h.len() * 2)
-                    }
-                    .to_vec();
+                    let bytes: Vec<u8> =
+                        unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u8, h.len() * 2) }
+                            .to_vec();
                     tensors.insert(
                         name.clone(),
                         TensorMeta {
@@ -498,7 +497,11 @@ pub mod bnb {
                 "bnb: dequantized {} packed 4-bit weights to f16 on the host (standard-pipeline bridge; packed NF4 stays resident only on gemma4)",
                 converted
             ));
-            Ok(DequantizedWeights { tensors, dense, inner })
+            Ok(DequantizedWeights {
+                tensors,
+                dense,
+                inner,
+            })
         }
     }
 
@@ -1225,8 +1228,16 @@ pub mod gguf {
             let mut out = vec![0u16; 32];
             dequant_q4_0(&blk, 32, &mut out).unwrap();
             for j in 0..16usize {
-                assert!((f16_to_f32(out[j]) - 0.25 * (j as f32 - 8.0)).abs() < 1e-3, "lo j={}", j);
-                assert!((f16_to_f32(out[j + 16]) - 0.25 * ((15 - j) as f32 - 8.0)).abs() < 1e-3, "hi j={}", j);
+                assert!(
+                    (f16_to_f32(out[j]) - 0.25 * (j as f32 - 8.0)).abs() < 1e-3,
+                    "lo j={}",
+                    j
+                );
+                assert!(
+                    (f16_to_f32(out[j + 16]) - 0.25 * ((15 - j) as f32 - 8.0)).abs() < 1e-3,
+                    "hi j={}",
+                    j
+                );
             }
         }
 
@@ -1279,7 +1290,11 @@ pub mod gguf {
             let mut out = vec![0u16; 32];
             dequant_q5_1(&blk, 32, &mut out).unwrap();
             for (r, &o) in out.iter().enumerate().take(32) {
-                let nib = if r < 16 { r as i32 } else { 15 - (r - 16) as i32 };
+                let nib = if r < 16 {
+                    r as i32
+                } else {
+                    15 - (r - 16) as i32
+                };
                 let hi = ((qh >> r) & 1) as i32 * 16;
                 let want = 0.5 * (nib + hi) as f32 + 2.0;
                 assert!((f16_to_f32(o) - want).abs() < 1e-2, "r={}", r);

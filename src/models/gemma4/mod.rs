@@ -1857,7 +1857,8 @@ impl Gemma4 {
                 // or orders-of-magnitude jump) at one layer index — and the
                 // index names the subsystem (5,11,17,23,29,35,41 are the
                 // global-attention d=512 layers).
-                if std::env::var("CIMA_G4_NORMS").is_ok() || std::env::var("CIMA_G4_DEBUG").is_ok() {
+                if std::env::var("CIMA_G4_NORMS").is_ok() || std::env::var("CIMA_G4_DEBUG").is_ok()
+                {
                     let mut layer_trace: Vec<Vec<f32>> = Vec::new();
                     self.forward_chunk_traced(
                         take,
@@ -2859,9 +2860,17 @@ mod tests {
         let mut t = HashMap::new();
         // A realistic Q4_K FFN-down weight [hidden, inter] = [1536, 6144].
         t.extend([
-            meta("language_model.layers.0.mlp.down_proj.weight", vec![1536, 6144], DType::GgufQ4K),
+            meta(
+                "language_model.layers.0.mlp.down_proj.weight",
+                vec![1536, 6144],
+                DType::GgufQ4K,
+            ),
             // The tied embedding is huge but excluded (device gather, not GEMM).
-            meta("language_model.embed_tokens.weight", vec![262144, 1536], DType::GgufQ4K),
+            meta(
+                "language_model.embed_tokens.weight",
+                vec![262144, 1536],
+                DType::GgufQ4K,
+            ),
             // A norm weight (f16) must not drive scratch.
             meta("language_model.norm.weight", vec![1536], DType::F16),
         ]);
@@ -2878,6 +2887,9 @@ mod tests {
             ffn, bytes
         );
         assert!(bytes > 0, "GGUF scratch sized 0 — the overflow bug");
-        assert!(bytes < embed, "embedding must be excluded from scratch sizing");
+        assert!(
+            bytes < embed,
+            "embedding must be excluded from scratch sizing"
+        );
     }
 }
