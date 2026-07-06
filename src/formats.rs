@@ -483,7 +483,12 @@ pub mod gguf {
             let name = c.string()?;
             let n_dims = c.u32()? as usize;
             if n_dims > 4 {
-                return Err(err!("gguf", "tensor '{}' has {} dims (max 4)", name, n_dims));
+                return Err(err!(
+                    "gguf",
+                    "tensor '{}' has {} dims (max 4)",
+                    name,
+                    n_dims
+                ));
             }
             let mut dims = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {

@@ -20,9 +20,10 @@ fn main() -> Res<()> {
     ];
 
     let client = Client::local();
-    let body = Json::obj()
-        .set("model", Json::s(&model))
-        .set("input", Json::Arr(texts.iter().map(|t| Json::s(t)).collect()));
+    let body = Json::obj().set("model", Json::s(&model)).set(
+        "input",
+        Json::Arr(texts.iter().map(|t| Json::s(t)).collect()),
+    );
     let resp = client.post_json("/api/embed", &body)?;
 
     let embs = resp

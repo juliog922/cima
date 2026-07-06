@@ -16,15 +16,15 @@
 //!    a missing arm is a build error, not a runtime surprise.
 
 use crate::cuda::{fmt_bytes, CudaCtx, DeviceBuf};
+use crate::err;
+use crate::formats::safetensors::{HalfCodec, SafetensorsLoader};
 use crate::json::{self};
 use crate::log;
 use crate::media::MediaRegistry;
 use crate::models::gemma4::{G4Config, Gemma4};
 use crate::models::transformer::Transformer;
-use crate::formats::safetensors::{HalfCodec, SafetensorsLoader};
 use crate::tokenizer::{render_chat, BpeTokenizer, ChatTurn};
 use crate::traits::*;
-use crate::err;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,161 +34,172 @@ pub mod towers;
 pub mod transformer;
 
 pub mod sampler {
-//! # sampler — the host-side sampling chain
-//!
-//! Deterministic, dependency-free token selection: repeat-penalty →
-//! temperature → top-k → top-p → categorical draw (xorshift64*), greedy
-//! argmax at `temperature == 0`. Split out of `transformer.rs` because it
-//! is pure host math shared by every architecture — the device top-k path
-//! (see `SAMPLE_TOPK`) feeds the same `finish` tail so the two cannot
-//! drift.
+    //! # sampler — the host-side sampling chain
+    //!
+    //! Deterministic, dependency-free token selection: repeat-penalty →
+    //! temperature → top-k → top-p → categorical draw (xorshift64*), greedy
+    //! argmax at `temperature == 0`. Split out of `transformer.rs` because it
+    //! is pure host math shared by every architecture — the device top-k path
+    //! (see `SAMPLE_TOPK`) feeds the same `finish` tail so the two cannot
+    //! drift.
 
-use crate::traits::{GenOptions, LogitsSampler};
+    use crate::traits::{GenOptions, LogitsSampler};
 
-
-/// Default sampling chain: repeat-penalty → temperature → top-k → top-p →
-/// categorical draw (xorshift64*). Greedy argmax when `temperature == 0`.
-pub struct DefaultSampler {
-    rng: u64,
-    /// Reusable per-token scratch. The full-logits path ranks the whole
-    /// vocabulary (100k+ ids) every token; without persistent buffers that
-    /// is a vocab-sized allocation per token on the CPU-sampling path.
-    idx: Vec<u32>,
-    vals: Vec<f32>,
-    probs: Vec<f32>,
-}
-
-impl DefaultSampler {
-    pub fn new(seed: u64) -> Self {
-        DefaultSampler {
-            rng: seed.max(1),
-            idx: Vec::new(),
-            vals: Vec::new(),
-            probs: Vec::new(),
-        }
+    /// Default sampling chain: repeat-penalty → temperature → top-k → top-p →
+    /// categorical draw (xorshift64*). Greedy argmax when `temperature == 0`.
+    pub struct DefaultSampler {
+        rng: u64,
+        /// Reusable per-token scratch. The full-logits path ranks the whole
+        /// vocabulary (100k+ ids) every token; without persistent buffers that
+        /// is a vocab-sized allocation per token on the CPU-sampling path.
+        idx: Vec<u32>,
+        vals: Vec<f32>,
+        probs: Vec<f32>,
     }
-    #[inline]
-    fn next_f32(&mut self) -> f32 {
-        // xorshift64* — deterministic, dependency-free.
-        let mut x = self.rng;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.rng = x;
-        ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u64 << 24) as f32
-    }
-}
 
-impl DefaultSampler {
-    /// Steps 3–7 of the chain over candidates ALREADY sorted descending
-    /// (and already repeat-penalized): temperature → softmax → top-p →
-    /// categorical draw. Shared verbatim by the full-logits path and the
-    /// device top-k path so the two cannot drift.
-    pub fn finish(&mut self, vals: &[f32], ids: &[u32], opts: &GenOptions) -> u32 {
-        debug_assert!(!vals.is_empty());
-        // GREEDY GUARD — candidates arrive sorted descending, so argmax is
-        // ids[0]. Without this, temperature 0 flowed into 1/T = ∞ below:
-        // the top candidate's softmax term became 0·∞ = NaN, every NaN
-        // comparison failed, and the fallthrough returned ids[cut-1] — the
-        // WORST candidate of the top-k, deterministically, every token
-        // (word-salad generations on all backends). The full-logits path
-        // had this guard; this shared tail did not.
-        if opts.temperature <= 0.0 {
-            return ids[0];
-        }
-        let inv_t = 1.0 / opts.temperature.max(1e-4);
-        let maxl = vals[0];
-        // Build the (temperature-scaled, softmaxed, top-p-truncated)
-        // distribution in the persistent buffer.
-        {
-            let probs = &mut self.probs;
-            probs.clear();
-            probs.extend(vals.iter().map(|v| ((v - maxl) * inv_t).exp()));
-            let sum: f32 = probs.iter().sum();
-            for p in probs.iter_mut() {
-                *p /= sum;
+    impl DefaultSampler {
+        pub fn new(seed: u64) -> Self {
+            DefaultSampler {
+                rng: seed.max(1),
+                idx: Vec::new(),
+                vals: Vec::new(),
+                probs: Vec::new(),
             }
-            let mut cut = probs.len();
-            let mut cum = 0.0;
-            for (i, &p) in probs.iter().enumerate() {
-                cum += p;
-                if cum >= opts.top_p {
-                    cut = i + 1;
-                    break;
+        }
+        #[inline]
+        fn next_f32(&mut self) -> f32 {
+            // xorshift64* — deterministic, dependency-free.
+            let mut x = self.rng;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.rng = x;
+            ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u64 << 24) as f32
+        }
+    }
+
+    impl DefaultSampler {
+        /// Steps 3–7 of the chain over candidates ALREADY sorted descending
+        /// (and already repeat-penalized): temperature → softmax → top-p →
+        /// categorical draw. Shared verbatim by the full-logits path and the
+        /// device top-k path so the two cannot drift.
+        pub fn finish(&mut self, vals: &[f32], ids: &[u32], opts: &GenOptions) -> u32 {
+            debug_assert!(!vals.is_empty());
+            // GREEDY GUARD — candidates arrive sorted descending, so argmax is
+            // ids[0]. Without this, temperature 0 flowed into 1/T = ∞ below:
+            // the top candidate's softmax term became 0·∞ = NaN, every NaN
+            // comparison failed, and the fallthrough returned ids[cut-1] — the
+            // WORST candidate of the top-k, deterministically, every token
+            // (word-salad generations on all backends). The full-logits path
+            // had this guard; this shared tail did not.
+            if opts.temperature <= 0.0 {
+                return ids[0];
+            }
+            let inv_t = 1.0 / opts.temperature.max(1e-4);
+            let maxl = vals[0];
+            // Build the (temperature-scaled, softmaxed, top-p-truncated)
+            // distribution in the persistent buffer.
+            {
+                let probs = &mut self.probs;
+                probs.clear();
+                probs.extend(vals.iter().map(|v| ((v - maxl) * inv_t).exp()));
+                let sum: f32 = probs.iter().sum();
+                for p in probs.iter_mut() {
+                    *p /= sum;
+                }
+                let mut cut = probs.len();
+                let mut cum = 0.0;
+                for (i, &p) in probs.iter().enumerate() {
+                    cum += p;
+                    if cum >= opts.top_p {
+                        cut = i + 1;
+                        break;
+                    }
+                }
+                probs.truncate(cut);
+            }
+            let renorm: f32 = self.probs.iter().sum();
+            let cut = self.probs.len();
+            let mut r = self.next_f32() * renorm;
+            for (i, &p) in self.probs.iter().enumerate() {
+                r -= p;
+                if r <= 0.0 {
+                    return ids[i];
                 }
             }
-            probs.truncate(cut);
+            ids[cut - 1]
         }
-        let renorm: f32 = self.probs.iter().sum();
-        let cut = self.probs.len();
-        let mut r = self.next_f32() * renorm;
-        for (i, &p) in self.probs.iter().enumerate() {
-            r -= p;
-            if r <= 0.0 {
-                return ids[i];
-            }
+
+        /// The device top-k twin of [`LogitsSampler::sample`]: candidates come
+        /// from `CudaCtx::topk_enqueue` (descending, penalty applied on
+        /// device), so only top-k truncation + the shared tail remain.
+        pub fn sample_candidates(&mut self, vals: &[f32], ids: &[u32], opts: &GenOptions) -> u32 {
+            let k = if opts.top_k == 0 {
+                vals.len()
+            } else {
+                opts.top_k.min(vals.len())
+            };
+            self.finish(&vals[..k], &ids[..k], opts)
         }
-        ids[cut - 1]
     }
 
-    /// The device top-k twin of [`LogitsSampler::sample`]: candidates come
-    /// from `CudaCtx::topk_enqueue` (descending, penalty applied on
-    /// device), so only top-k truncation + the shared tail remain.
-    pub fn sample_candidates(&mut self, vals: &[f32], ids: &[u32], opts: &GenOptions) -> u32 {
-        let k = if opts.top_k == 0 { vals.len() } else { opts.top_k.min(vals.len()) };
-        self.finish(&vals[..k], &ids[..k], opts)
-    }
-}
-
-impl LogitsSampler for DefaultSampler {
-    fn sample(&mut self, logits: &mut [f32], history: &[u32], opts: &GenOptions) -> u32 {
-        // 1. Repeat penalty over the recent window (last 64 tokens).
-        if opts.repeat_penalty != 1.0 {
-            let window = &history[history.len().saturating_sub(64)..];
-            for &t in window {
-                if let Some(l) = logits.get_mut(t as usize) {
-                    *l = if *l > 0.0 { *l / opts.repeat_penalty } else { *l * opts.repeat_penalty };
+    impl LogitsSampler for DefaultSampler {
+        fn sample(&mut self, logits: &mut [f32], history: &[u32], opts: &GenOptions) -> u32 {
+            // 1. Repeat penalty over the recent window (last 64 tokens).
+            if opts.repeat_penalty != 1.0 {
+                let window = &history[history.len().saturating_sub(64)..];
+                for &t in window {
+                    if let Some(l) = logits.get_mut(t as usize) {
+                        *l = if *l > 0.0 {
+                            *l / opts.repeat_penalty
+                        } else {
+                            *l * opts.repeat_penalty
+                        };
+                    }
                 }
             }
+            // 2. Greedy path.
+            if opts.temperature <= 0.0 {
+                return logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0);
+            }
+            // 3..7 shared with the device-candidate path.
+            let k = if opts.top_k == 0 {
+                logits.len()
+            } else {
+                opts.top_k.min(logits.len())
+            };
+            // Tie-break canon: equal logits rank by DESCENDING index — the
+            // same order the device masked-argmax produces (the packed u64
+            // compares index bits when values tie). Without a canon, ties at
+            // the top-k boundary make the host and device paths diverge.
+            let by_canon = |&a: &u32, &b: &u32| {
+                logits[b as usize]
+                    .partial_cmp(&logits[a as usize])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.cmp(&a))
+            };
+            // Take the scratch buffers so finish() can hold &mut self without
+            // aliasing them; return them afterward for reuse next token.
+            let mut idx = std::mem::take(&mut self.idx);
+            let mut vals = std::mem::take(&mut self.vals);
+            idx.clear();
+            idx.extend(0..logits.len() as u32);
+            idx.select_nth_unstable_by(k - 1, by_canon);
+            idx.truncate(k);
+            idx.sort_unstable_by(by_canon);
+            vals.clear();
+            vals.extend(idx.iter().map(|&i| logits[i as usize]));
+            let chosen = self.finish(&vals, &idx, opts);
+            self.idx = idx;
+            self.vals = vals;
+            chosen
         }
-        // 2. Greedy path.
-        if opts.temperature <= 0.0 {
-            return logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
-        }
-        // 3..7 shared with the device-candidate path.
-        let k = if opts.top_k == 0 { logits.len() } else { opts.top_k.min(logits.len()) };
-        // Tie-break canon: equal logits rank by DESCENDING index — the
-        // same order the device masked-argmax produces (the packed u64
-        // compares index bits when values tie). Without a canon, ties at
-        // the top-k boundary make the host and device paths diverge.
-        let by_canon = |&a: &u32, &b: &u32| {
-            logits[b as usize]
-                .partial_cmp(&logits[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.cmp(&a))
-        };
-        // Take the scratch buffers so finish() can hold &mut self without
-        // aliasing them; return them afterward for reuse next token.
-        let mut idx = std::mem::take(&mut self.idx);
-        let mut vals = std::mem::take(&mut self.vals);
-        idx.clear();
-        idx.extend(0..logits.len() as u32);
-        idx.select_nth_unstable_by(k - 1, by_canon);
-        idx.truncate(k);
-        idx.sort_unstable_by(by_canon);
-        vals.clear();
-        vals.extend(idx.iter().map(|&i| logits[i as usize]));
-        let chosen = self.finish(&vals, &idx, opts);
-        self.idx = idx;
-        self.vals = vals;
-        chosen
     }
-}
 }
 
 pub use sampler::DefaultSampler;
@@ -319,13 +330,19 @@ impl Arch {
     pub fn seed_device_token(&self) -> Res<()> {
         match self {
             Arch::Std(t) => t.seed_device_token(),
-            Arch::Gemma4(_) => Err(err!("generate", "device pipeline unsupported for this family")),
+            Arch::Gemma4(_) => Err(err!(
+                "generate",
+                "device pipeline unsupported for this family"
+            )),
         }
     }
     pub fn decode_step_device(&mut self, pos: usize) -> Res<()> {
         match self {
             Arch::Std(t) => t.decode_step_device(pos),
-            Arch::Gemma4(_) => Err(err!("generate", "device pipeline unsupported for this family")),
+            Arch::Gemma4(_) => Err(err!(
+                "generate",
+                "device pipeline unsupported for this family"
+            )),
         }
     }
     /// Total resident weight bytes (the [`Architecture`] contract; the
@@ -339,7 +356,10 @@ impl Arch {
     /// Vision GPU-vs-CPU self-test (gemma4 only).
     pub fn vision_selftest(&mut self) -> Res<()> {
         match self {
-            Arch::Std(_) => Err(err!("selftest", "vision self-test is implemented for the gemma4 pipeline only")),
+            Arch::Std(_) => Err(err!(
+                "selftest",
+                "vision self-test is implemented for the gemma4 pipeline only"
+            )),
             Arch::Gemma4(g) => g.vision_selftest(),
         }
     }
@@ -391,8 +411,13 @@ pub struct LoadedModel {
 
 /// Known media-placeholder literals, probed against the tokenizer's specials.
 const MEDIA_LITERALS: &[&str] = &[
-    "<image>", "<|image_pad|>", "<|IMAGE|>", "<|vision_pad|>",
-    "<|AUDIO|>", "<|audio_pad|>", "<audio>",
+    "<image>",
+    "<|image_pad|>",
+    "<|IMAGE|>",
+    "<|vision_pad|>",
+    "<|AUDIO|>",
+    "<|audio_pad|>",
+    "<audio>",
 ];
 
 /// Byte offset of the earliest stop-sequence occurrence in `text`, or None.
@@ -441,11 +466,24 @@ impl LoadedModel {
             }
         }
         println!("tokenizer specials: {:?}", self.tokenizer.specials());
-        let turns = [ChatTurn { role: "user".into(), content: "Describe this image".into(), n_images: 1, n_audio: 0 }];
+        let turns = [ChatTurn {
+            role: "user".into(),
+            content: "Describe this image".into(),
+            n_images: 1,
+            n_audio: 0,
+        }];
         let rendered = self.render_chat(&turns);
-        println!("rendered template ({} chars): {:?}", rendered.len(), rendered);
+        println!(
+            "rendered template ({} chars): {:?}",
+            rendered.len(),
+            rendered
+        );
         let prepared = self.prepare(&rendered, &[ppm], &[])?;
-        println!("prepared: {} tokens, {} media spans", prepared.tokens.len(), prepared.media_embeds.len());
+        println!(
+            "prepared: {} tokens, {} media spans",
+            prepared.tokens.len(),
+            prepared.media_embeds.len()
+        );
         let media: Vec<(usize, u64, usize)> = prepared
             .media_embeds
             .iter()
@@ -464,7 +502,12 @@ impl LoadedModel {
 
     /// Build a [`PreparedPrompt`]: tokenize, run encoder towers over each
     /// media item, and splice the embedding spans over placeholder tokens.
-    pub fn prepare(&mut self, prompt: &str, images: &[Vec<u8>], audio: &[Vec<u8>]) -> Res<PreparedPrompt> {
+    pub fn prepare(
+        &mut self,
+        prompt: &str,
+        images: &[Vec<u8>],
+        audio: &[Vec<u8>],
+    ) -> Res<PreparedPrompt> {
         if let Arch::Gemma4(_) = &self.arch {
             return self.prepare_gemma4(prompt, images, audio);
         }
@@ -476,12 +519,21 @@ impl LoadedModel {
                 Arch::Gemma4(_) => unreachable!(),
             };
             let tower = std_arch.vision.as_ref().ok_or_else(|| {
-                err!("media", "model '{}' has no vision tower but image #{} was supplied", self.name, i)
+                err!(
+                    "media",
+                    "model '{}' has no vision tower but image #{} was supplied",
+                    self.name,
+                    i
+                )
             })?;
             let edge = tower.ec.input_size;
-            let img = self
-                .media
-                .decode_image(bytes, edge, edge, [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])?;
+            let img = self.media.decode_image(
+                bytes,
+                edge,
+                edge,
+                [0.48145466, 0.4578275, 0.40821073],
+                [0.26862954, 0.261_302_6, 0.275_777_1],
+            )?;
             chunks.push(tower.encode_image(&std_arch.ctx, &img)?);
         }
         for (i, bytes) in audio.iter().enumerate() {
@@ -490,7 +542,12 @@ impl LoadedModel {
                 Arch::Gemma4(_) => unreachable!(),
             };
             let tower = std_arch.audio.as_ref().ok_or_else(|| {
-                err!("media", "model '{}' has no audio tower but audio clip #{} was supplied", self.name, i)
+                err!(
+                    "media",
+                    "model '{}' has no audio tower but audio clip #{} was supplied",
+                    self.name,
+                    i
+                )
             })?;
             let pcm = self.media.decode_audio(bytes, 16_000)?;
             chunks.push(tower.encode_audio(&std_arch.ctx, &pcm)?);
@@ -498,7 +555,13 @@ impl LoadedModel {
 
         // 2. Tokenize. Placeholders may or may not be present in the text.
         let mut text = prompt.to_string();
-        if !chunks.is_empty() && self.media_token.as_deref().map(|t| !text.contains(t)).unwrap_or(true) {
+        if !chunks.is_empty()
+            && self
+                .media_token
+                .as_deref()
+                .map(|t| !text.contains(t))
+                .unwrap_or(true)
+        {
             // No placeholder in the prompt: prepend one per media item.
             if let Some(tok) = &self.media_token {
                 let mut pre = String::new();
@@ -513,7 +576,10 @@ impl LoadedModel {
 
         // 3. Splice: each placeholder id expands to `rows` ids, and the span
         //    is recorded so prefill overwrites those embedding rows.
-        let ph_id = self.media_token.as_deref().and_then(|t| self.tokenizer.special(t));
+        let ph_id = self
+            .media_token
+            .as_deref()
+            .and_then(|t| self.tokenizer.special(t));
         let mut out_tokens = Vec::with_capacity(tokens.len());
         let mut media_embeds = Vec::new();
         let mut next = chunks.into_iter();
@@ -541,7 +607,11 @@ impl LoadedModel {
         if next.next().is_some() {
             return Err(err!("media", "more media items supplied than placeholders consumed — encoder output would be dropped"));
         }
-        Ok(PreparedPrompt { tokens: out_tokens, media_embeds, block_ids: Vec::new() })
+        Ok(PreparedPrompt {
+            tokens: out_tokens,
+            media_embeds,
+            block_ids: Vec::new(),
+        })
     }
 
     /// Gemma 4 prompt preparation. Media items are encoded through the
@@ -552,7 +622,12 @@ impl LoadedModel {
     /// Image soft-token spans receive consecutive block ids so prefill
     /// attends bidirectionally inside each image, matching the reference
     /// mask; audio spans stay causal.
-    fn prepare_gemma4(&mut self, prompt: &str, images: &[Vec<u8>], audio: &[Vec<u8>]) -> Res<PreparedPrompt> {
+    fn prepare_gemma4(
+        &mut self,
+        prompt: &str,
+        images: &[Vec<u8>],
+        audio: &[Vec<u8>],
+    ) -> Res<PreparedPrompt> {
         let g = match &self.arch {
             Arch::Gemma4(g) => g,
             Arch::Std(_) => unreachable!(),
@@ -573,7 +648,12 @@ impl LoadedModel {
         let mut img_chunks: Vec<(DeviceBuf, usize)> = Vec::new();
         for (i, bytes) in images.iter().enumerate() {
             if !g.has_vision() {
-                return Err(err!("media", "model '{}' has no vision tower but image #{} was supplied", self.name, i));
+                return Err(err!(
+                    "media",
+                    "model '{}' has no vision tower but image #{} was supplied",
+                    self.name,
+                    i
+                ));
             }
             // Aspect-preserving resize per the reference processor; the
             // soft-token count varies with the image's aspect ratio.
@@ -589,21 +669,40 @@ impl LoadedModel {
             // reference implementation's `get_image_features` output.
             if let Ok(base) = std::env::var("CIMA_DUMP_SOFT") {
                 let hs = g.config().text.hidden;
-                gemma4::dump_f16_matrix(g.ctx(), chunk.0.ptr, chunk.1, hs, &format!("{}.{}.soft", base, i), "soft tokens")?;
+                gemma4::dump_f16_matrix(
+                    g.ctx(),
+                    chunk.0.ptr,
+                    chunk.1,
+                    hs,
+                    &format!("{}.{}.soft", base, i),
+                    "soft tokens",
+                )?;
             }
             img_chunks.push(chunk);
         }
         let mut aud_chunks: Vec<(DeviceBuf, usize)> = Vec::new();
         for (i, bytes) in audio.iter().enumerate() {
             if !g.has_audio() {
-                return Err(err!("media", "model '{}' has no audio tower but audio clip #{} was supplied", self.name, i));
+                return Err(err!(
+                    "media",
+                    "model '{}' has no audio tower but audio clip #{} was supplied",
+                    self.name,
+                    i
+                ));
             }
             let pcm = self.media.decode_audio(bytes, 16_000)?;
             let chunk = g.encode_audio(&pcm)?;
             // Same A/B dump as image soft tokens — `.aud.{i}.soft` files.
             if let Ok(base) = std::env::var("CIMA_DUMP_SOFT") {
                 let hs = g.config().text.hidden;
-                gemma4::dump_f16_matrix(g.ctx(), chunk.0.ptr, chunk.1, hs, &format!("{}.aud.{}.soft", base, i), "audio soft tokens")?;
+                gemma4::dump_f16_matrix(
+                    g.ctx(),
+                    chunk.0.ptr,
+                    chunk.1,
+                    hs,
+                    &format!("{}.aud.{}.soft", base, i),
+                    "audio soft tokens",
+                )?;
             }
             if std::env::var("CIMA_G4_DEBUG").is_ok() {
                 // Degenerate-output triage: healthy soft tokens carry RMS
@@ -625,8 +724,15 @@ impl LoadedModel {
                 let rms = (sq / (chunk.1 * hs) as f64).sqrt();
                 eprintln!(
                     "g4 audio clip #{}: {:.2}s pcm → {} soft tokens, rms {:.4}{}",
-                    i, pcm.samples.len() as f64 / pcm.sample_rate as f64, chunk.1, rms,
-                    if n_nan > 0 { format!(", {} NaN!", n_nan) } else { String::new() }
+                    i,
+                    pcm.samples.len() as f64 / pcm.sample_rate as f64,
+                    chunk.1,
+                    rms,
+                    if n_nan > 0 {
+                        format!(", {} NaN!", n_nan)
+                    } else {
+                        String::new()
+                    }
                 );
             }
             aud_chunks.push(chunk);
@@ -636,7 +742,10 @@ impl LoadedModel {
         // Recognized placeholders: "<image>" and "<audio>" (the engine's
         // generic literals). Without placeholders, media is prepended.
         #[derive(Clone, Copy, PartialEq)]
-        enum Seg { Img, Aud }
+        enum Seg {
+            Img,
+            Aud,
+        }
         let mut segments: Vec<(String, Option<Seg>)> = Vec::new();
         {
             let mut rest = prompt;
@@ -661,8 +770,14 @@ impl LoadedModel {
                 }
             }
         }
-        let ph_imgs = segments.iter().filter(|(_, s)| *s == Some(Seg::Img)).count();
-        let ph_auds = segments.iter().filter(|(_, s)| *s == Some(Seg::Aud)).count();
+        let ph_imgs = segments
+            .iter()
+            .filter(|(_, s)| *s == Some(Seg::Img))
+            .count();
+        let ph_auds = segments
+            .iter()
+            .filter(|(_, s)| *s == Some(Seg::Aud))
+            .count();
         if ph_imgs > img_chunks.len() || ph_auds > aud_chunks.len() {
             return Err(err!(
                 "media",
@@ -679,7 +794,11 @@ impl LoadedModel {
         let mut next_aud = aud_chunks.into_iter();
         let mut img_block = 0i32;
 
-        let push_text = |s: &str, tokens: &mut Vec<u32>, block_ids: &mut Vec<i32>, tk: &BpeTokenizer, bos: bool| {
+        let push_text = |s: &str,
+                         tokens: &mut Vec<u32>,
+                         block_ids: &mut Vec<i32>,
+                         tk: &BpeTokenizer,
+                         bos: bool| {
             if s.is_empty() && !bos {
                 return;
             }
@@ -693,19 +812,28 @@ impl LoadedModel {
         // mask over the soft tokens. The reference gates this on
         // `text_config.use_bidirectional_attention == "vision"`.
         let bidir = cfg.text.bidir_vision;
-        let mut splice_img = |buf: DeviceBuf, rows: usize, tokens: &mut Vec<u32>, block_ids: &mut Vec<i32>, media: &mut Vec<(usize, DeviceBuf, usize)>| {
-            tokens.push(boi);
-            block_ids.push(-1);
-            media.push((tokens.len(), buf, rows));
-            for _ in 0..rows {
-                tokens.push(img_id);
-                block_ids.push(if bidir { img_block } else { -1 });
-            }
-            img_block += 1;
-            tokens.push(eoi);
-            block_ids.push(-1);
-        };
-        let splice_aud = |buf: DeviceBuf, rows: usize, tokens: &mut Vec<u32>, block_ids: &mut Vec<i32>, media: &mut Vec<(usize, DeviceBuf, usize)>| {
+        let mut splice_img =
+            |buf: DeviceBuf,
+             rows: usize,
+             tokens: &mut Vec<u32>,
+             block_ids: &mut Vec<i32>,
+             media: &mut Vec<(usize, DeviceBuf, usize)>| {
+                tokens.push(boi);
+                block_ids.push(-1);
+                media.push((tokens.len(), buf, rows));
+                for _ in 0..rows {
+                    tokens.push(img_id);
+                    block_ids.push(if bidir { img_block } else { -1 });
+                }
+                img_block += 1;
+                tokens.push(eoi);
+                block_ids.push(-1);
+            };
+        let splice_aud = |buf: DeviceBuf,
+                          rows: usize,
+                          tokens: &mut Vec<u32>,
+                          block_ids: &mut Vec<i32>,
+                          media: &mut Vec<(usize, DeviceBuf, usize)>| {
             tokens.push(boa);
             block_ids.push(-1);
             media.push((tokens.len(), buf, rows));
@@ -764,10 +892,19 @@ impl LoadedModel {
                 .iter()
                 .map(|&id| String::from_utf8_lossy(&self.tokenizer.decode_bytes(id)).into_owned())
                 .collect();
-            eprintln!("g4 prompt ids (first {} of {}): {:?}", head.len(), tokens.len(), head);
+            eprintln!(
+                "g4 prompt ids (first {} of {}): {:?}",
+                head.len(),
+                tokens.len(),
+                head
+            );
             eprintln!("g4 prompt pieces: {:?}", pieces);
         }
-        Ok(PreparedPrompt { tokens, media_embeds, block_ids })
+        Ok(PreparedPrompt {
+            tokens,
+            media_embeds,
+            block_ids,
+        })
     }
 
     /// Chat-aware prepare: when the freshly rendered prompt extends the
@@ -798,17 +935,29 @@ impl LoadedModel {
             // back to the canonical path so quality is never hostage.
             if std::env::var("CIMA_INCR_CHECK").is_ok() {
                 let canonical = self.prepare(rendered, &[], &[])?;
-                let div = tokens.iter().zip(canonical.tokens.iter()).position(|(a, b)| a != b);
+                let div = tokens
+                    .iter()
+                    .zip(canonical.tokens.iter())
+                    .position(|(a, b)| a != b);
                 eprintln!(
                     "incr-check: chained={} canonical={} first_divergence={:?} suffix_starts_at={}",
-                    tokens.len(), canonical.tokens.len(), div, self.session_ids.len()
+                    tokens.len(),
+                    canonical.tokens.len(),
+                    div,
+                    self.session_ids.len()
                 );
                 if tokens.len() != canonical.tokens.len() {
-                    eprintln!("incr-check: LENGTH DRIFT — using canonical (full prefill) this turn");
+                    eprintln!(
+                        "incr-check: LENGTH DRIFT — using canonical (full prefill) this turn"
+                    );
                     return Ok(canonical);
                 }
             }
-            return Ok(PreparedPrompt { tokens, media_embeds: Vec::new(), block_ids: Vec::new() });
+            return Ok(PreparedPrompt {
+                tokens,
+                media_embeds: Vec::new(),
+                block_ids: Vec::new(),
+            });
         }
         self.prepare(rendered, &[], &[])
     }
@@ -850,7 +999,11 @@ impl LoadedModel {
                 toks.len(),
                 self.arch.max_seq()
             ));
-            truncated = PreparedPrompt { tokens: toks, media_embeds: Vec::new(), block_ids: Vec::new() };
+            truncated = PreparedPrompt {
+                tokens: toks,
+                media_embeds: Vec::new(),
+                block_ids: Vec::new(),
+            };
             &truncated
         } else {
             prepared
@@ -882,7 +1035,10 @@ impl LoadedModel {
             && prepared.block_ids.is_empty()
             && std::env::var("CIMA_NO_INCR").is_err()
         {
-            let cap = self.session_ids.len().min(prepared.tokens.len().saturating_sub(1));
+            let cap = self
+                .session_ids
+                .len()
+                .min(prepared.tokens.len().saturating_sub(1));
             while cp < cap && self.session_ids[cp] == prepared.tokens[cp] {
                 cp += 1;
             }
@@ -924,15 +1080,18 @@ impl LoadedModel {
             None
         };
         let constrained = guard.is_some() || schema.is_some();
-        let greedy =
-            (opts.temperature <= 0.0 || opts.top_k == 1) && opts.repeat_penalty == 1.0 && !constrained;
+        let greedy = (opts.temperature <= 0.0 || opts.top_k == 1)
+            && opts.repeat_penalty == 1.0
+            && !constrained;
         // Device-resident pipeline: each step reads its input token from
         // device memory (written by the previous argmax) and the 8-byte id
         // fetch overlaps the next step's compute. Identical output to the
         // sync path; CIMA_NO_PIPELINE=1 forces the sync path.
         let pipeline = greedy
             && self.arch.supports_device_pipeline()
-            && std::env::var("CIMA_NO_PIPELINE").map(|v| v != "1").unwrap_or(true);
+            && std::env::var("CIMA_NO_PIPELINE")
+                .map(|v| v != "1")
+                .unwrap_or(true);
 
         // Device top-k sampling: the sampler truncates to top-k before
         // top-p, so extracting the top-SAMPLE_TOPK candidates on device is
@@ -942,12 +1101,18 @@ impl LoadedModel {
             && !constrained
             && opts.top_k >= 1
             && opts.top_k <= crate::models::transformer::SAMPLE_TOPK
-            && std::env::var("CIMA_NO_GRAPH").map(|v| v != "1").unwrap_or(true);
+            && std::env::var("CIMA_NO_GRAPH")
+                .map(|v| v != "1")
+                .unwrap_or(true);
 
         let mut logits = Vec::new();
         let mut candidates: Option<(Vec<f32>, Vec<u32>)> = None;
         let mut next_greedy = 0u32;
-        let fetch = if pipeline { Some(self.arch.ctx().token_fetch()?) } else { None };
+        let fetch = if pipeline {
+            Some(self.arch.ctx().token_fetch()?)
+        } else {
+            None
+        };
         if greedy {
             next_greedy = self.arch.prefill_argmax(prefill_input, cp)?;
             if pipeline {
@@ -959,8 +1124,10 @@ impl LoadedModel {
         } else {
             logits = self.arch.prefill(prefill_input, cp)?;
             if sample_graph_ok {
-                self.arch.arm_sample_graph(prepared.tokens.len(), opts.repeat_penalty)?;
-                self.arch.hist_reset_and_seed(&prepared.tokens, prepared.tokens.len())?;
+                self.arch
+                    .arm_sample_graph(prepared.tokens.len(), opts.repeat_penalty)?;
+                self.arch
+                    .hist_reset_and_seed(&prepared.tokens, prepared.tokens.len())?;
             }
         }
         let mut history = prepared.tokens.clone();
@@ -975,7 +1142,9 @@ impl LoadedModel {
         // EOS or a stop string proves otherwise.
         let mut stop_reason: &'static str = "length";
 
-        let budget = opts.max_tokens.min(self.arch.max_seq().saturating_sub(prepared.tokens.len()));
+        let budget = opts
+            .max_tokens
+            .min(self.arch.max_seq().saturating_sub(prepared.tokens.len()));
         'gen: for step in 0..budget {
             if let Some(sg) = schema.as_mut() {
                 if sg.finished() {
@@ -1108,7 +1277,9 @@ impl LoadedModel {
             // producing argmax and the next step's memset.
             if let Some(f) = &fetch {
                 self.arch.decode_step_device(prepared.tokens.len() + step)?;
-                self.arch.ctx().fetch_token_async(self.arch.argmax_slot(), f)?;
+                self.arch
+                    .ctx()
+                    .fetch_token_async(self.arch.argmax_slot(), f)?;
             }
             n_gen += 1;
             history.push(tok);
@@ -1124,7 +1295,11 @@ impl LoadedModel {
             // An invalid prefix can't be the start of a longer sequence —
             // flush it lossily rather than stalling the stream (max UTF-8
             // continuation is 3 trailing bytes).
-            let flush = if pending.len() - valid > 3 { pending.len() } else { valid };
+            let flush = if pending.len() - valid > 3 {
+                pending.len()
+            } else {
+                valid
+            };
             if flush > 0 {
                 let piece = String::from_utf8_lossy(&pending[..flush]).into_owned();
                 pending.drain(..flush);
@@ -1159,9 +1334,13 @@ impl LoadedModel {
                 // above merely wastes one speculative launch.
                 next_greedy = f.wait()?;
             } else if greedy {
-                next_greedy = self.arch.decode_step_argmax(tok, prepared.tokens.len() + step)?;
+                next_greedy = self
+                    .arch
+                    .decode_step_argmax(tok, prepared.tokens.len() + step)?;
             } else if sample_graph_ok && self.arch.sample_graph_active() {
-                let packed = self.arch.decode_step_sample(tok, prepared.tokens.len() + step)?;
+                let packed = self
+                    .arch
+                    .decode_step_sample(tok, prepared.tokens.len() + step)?;
                 let mut vals = Vec::with_capacity(packed.len());
                 let mut ids = Vec::with_capacity(packed.len());
                 for p in packed {
@@ -1183,7 +1362,11 @@ impl LoadedModel {
 
         let total_ms = t0.elapsed().as_secs_f64() * 1e3;
         let decode_ms = (total_ms - ttft_ms).max(1e-3);
-        let tok_per_s = if n_gen > 1 { (n_gen - 1) as f64 / (decode_ms / 1e3) } else { 0.0 };
+        let tok_per_s = if n_gen > 1 {
+            (n_gen - 1) as f64 / (decode_ms / 1e3)
+        } else {
+            0.0
+        };
         let snap1 = self.arch.ctx().snapshot();
         log::metric(
             "inference",
@@ -1196,7 +1379,10 @@ impl LoadedModel {
                 ("tok_per_s", format!("{:.2}", tok_per_s)),
                 ("total_ms", format!("{:.2}", total_ms)),
                 ("vram_used", snap1.vram_used.to_string()),
-                ("vram_delta", (snap1.vram_used as i64 - snap0.vram_used as i64).to_string()),
+                (
+                    "vram_delta",
+                    (snap1.vram_used as i64 - snap0.vram_used as i64).to_string(),
+                ),
                 (
                     "host_ms",
                     match self.arch.perf_take() {
@@ -1240,7 +1426,14 @@ impl LoadedModel {
             Arch::Gemma4(_) => Some("gemma"),
             Arch::Std(_) => None,
         };
-        render_chat(&self.dir, &self.tokenizer, family, turns, self.media_token.as_deref(), self.chat_template.as_deref())
+        render_chat(
+            &self.dir,
+            &self.tokenizer,
+            family,
+            turns,
+            self.media_token.as_deref(),
+            self.chat_template.as_deref(),
+        )
     }
 }
 
@@ -1266,7 +1459,9 @@ pub enum KeepAlive {
 impl KeepAlive {
     /// Parse the `keep_alive` field of an API request (absent → Default).
     pub fn parse(v: Option<&crate::json::Json>) -> KeepAlive {
-        let Some(v) = v else { return KeepAlive::Default };
+        let Some(v) = v else {
+            return KeepAlive::Default;
+        };
         if let Some(n) = v.as_f64() {
             return if n < 0.0 {
                 KeepAlive::Forever
@@ -1276,7 +1471,9 @@ impl KeepAlive {
                 KeepAlive::Seconds(n as u64)
             };
         }
-        let Some(s) = v.as_str() else { return KeepAlive::Default };
+        let Some(s) = v.as_str() else {
+            return KeepAlive::Default;
+        };
         let s = s.trim();
         if s == "0" {
             return KeepAlive::Now;
@@ -1285,14 +1482,20 @@ impl KeepAlive {
             return KeepAlive::Forever;
         }
         let (num, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
-        let Ok(n) = num.trim().parse::<f64>() else { return KeepAlive::Default };
+        let Ok(n) = num.trim().parse::<f64>() else {
+            return KeepAlive::Default;
+        };
         let secs = match unit.trim() {
             "" | "s" => n,
             "m" => n * 60.0,
             "h" => n * 3600.0,
             _ => return KeepAlive::Default,
         };
-        if secs <= 0.0 { KeepAlive::Now } else { KeepAlive::Seconds(secs as u64) }
+        if secs <= 0.0 {
+            KeepAlive::Now
+        } else {
+            KeepAlive::Seconds(secs as u64)
+        }
     }
 }
 
@@ -1322,25 +1525,30 @@ impl ModelManager {
                     KeepAlive::parse(Some(&crate::json::Json::s(raw.trim())))
                 };
                 match parsed {
-                KeepAlive::Forever => {
-                    log::info("CIMA_KEEP_ALIVE=forever — models stay resident until evicted explicitly");
-                    None
-                }
-                KeepAlive::Seconds(s) => {
-                    log::info(&format!("CIMA_KEEP_ALIVE — default residency window set to {}s", s));
-                    Some(std::time::Duration::from_secs(s))
-                }
-                KeepAlive::Now => {
-                    log::info("CIMA_KEEP_ALIVE=0 — models are released right after each request");
-                    Some(std::time::Duration::ZERO)
-                }
-                KeepAlive::Default => {
-                    log::warn(&format!(
+                    KeepAlive::Forever => {
+                        log::info("CIMA_KEEP_ALIVE=forever — models stay resident until evicted explicitly");
+                        None
+                    }
+                    KeepAlive::Seconds(s) => {
+                        log::info(&format!(
+                            "CIMA_KEEP_ALIVE — default residency window set to {}s",
+                            s
+                        ));
+                        Some(std::time::Duration::from_secs(s))
+                    }
+                    KeepAlive::Now => {
+                        log::info(
+                            "CIMA_KEEP_ALIVE=0 — models are released right after each request",
+                        );
+                        Some(std::time::Duration::ZERO)
+                    }
+                    KeepAlive::Default => {
+                        log::warn(&format!(
                         "CIMA_KEEP_ALIVE='{}' is not a duration (expected e.g. 600, 90s, 10m, 2h, -1, forever) — keeping the 5-minute default",
                         raw
                     ));
-                    Some(std::time::Duration::from_secs(300))
-                }
+                        Some(std::time::Duration::from_secs(300))
+                    }
                 }
             }
         };
@@ -1369,7 +1577,12 @@ impl ModelManager {
     /// Evict the resident model if its keep-alive window has elapsed.
     /// Called by the server's sweeper between requests.
     pub fn sweep(&mut self) {
-        if self.current.is_some() && self.expires_at.map(|t| std::time::Instant::now() >= t).unwrap_or(false) {
+        if self.current.is_some()
+            && self
+                .expires_at
+                .map(|t| std::time::Instant::now() >= t)
+                .unwrap_or(false)
+        {
             log::info("keep-alive expired; releasing the resident model");
             self.evict();
         }
@@ -1377,7 +1590,10 @@ impl ModelManager {
 
     /// Seconds until eviction (None = forever / nothing resident).
     pub fn expires_in_secs(&self) -> Option<u64> {
-        self.expires_at.map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs())
+        self.expires_at.map(|t| {
+            t.saturating_duration_since(std::time::Instant::now())
+                .as_secs()
+        })
     }
 
     /// After a fatal (sticky) CUDA error the primary context is dead
@@ -1436,7 +1652,12 @@ impl ModelManager {
         // Every API connection runs on its own OS thread; make the primary
         // context current here, the choke point all GPU work flows through.
         self.ctx.bind();
-        if self.current.as_ref().map(|m| m.name == name).unwrap_or(false) {
+        if self
+            .current
+            .as_ref()
+            .map(|m| m.name == name)
+            .unwrap_or(false)
+        {
             return Ok(self.current.as_mut().unwrap());
         }
         self.evict();
@@ -1565,10 +1786,22 @@ impl ModelManager {
             // Gemma 4 runs its own exhaustive config parse: the generic
             // ModelConfig cannot express per-type RoPE, KV sharing, PLE or
             // the tower geometries.
-            let raw = std::fs::read_to_string(dir.join("config.json"))
-                .map_err(|e| err!("config", "cannot re-read {}/config.json: {}", dir.display(), e))?;
-            let j = json::parse(&raw)
-                .map_err(|e| err!("config", "{}/config.json is not valid JSON: {}", dir.display(), e))?;
+            let raw = std::fs::read_to_string(dir.join("config.json")).map_err(|e| {
+                err!(
+                    "config",
+                    "cannot re-read {}/config.json: {}",
+                    dir.display(),
+                    e
+                )
+            })?;
+            let j = json::parse(&raw).map_err(|e| {
+                err!(
+                    "config",
+                    "{}/config.json is not valid JSON: {}",
+                    dir.display(),
+                    e
+                )
+            })?;
             let g4 = G4Config::parse(&j)?;
             // Forecast mirrors Gemma4::build exactly: the PLE token table and
             // the audio subsampling convs stay host-resident, so the largest
@@ -1586,7 +1819,12 @@ impl ModelManager {
                 .map(|t| t.numel() * t.dtype.size())
                 .max()
                 .unwrap_or(0);
-            let forecast = VramForecast { weights: w, kv_cache: kv, workspace: ws, load_transient: transient };
+            let forecast = VramForecast {
+                weights: w,
+                kv_cache: kv,
+                workspace: ws,
+                load_transient: transient,
+            };
             forecast.check(&self.ctx, name)?;
             VramForecast::host_guard(weights.as_ref(), name)?;
             Arch::Gemma4(Gemma4::build(self.ctx.clone(), g4, weights, &codec)?)
@@ -1594,7 +1832,12 @@ impl ModelManager {
             let forecast = VramForecast::compute(&cfg, weights.as_ref(), &codec);
             forecast.check(&self.ctx, name)?;
             VramForecast::host_guard(weights.as_ref(), name)?;
-            Arch::Std(Transformer::build(self.ctx.clone(), cfg, weights.as_ref(), &codec)?)
+            Arch::Std(Transformer::build(
+                self.ctx.clone(),
+                cfg,
+                weights.as_ref(),
+                &codec,
+            )?)
         };
         let tokenizer = BpeTokenizer::load(&dir)?;
         let media_token = MEDIA_LITERALS
@@ -1611,11 +1854,18 @@ impl ModelManager {
                 ("load_ms", format!("{:.1}", load_ms)),
                 ("vram_pre", snap0.vram_used.to_string()),
                 ("vram_post", snap1.vram_used.to_string()),
-                ("vram_delta", (snap1.vram_used as i64 - snap0.vram_used as i64).to_string()),
+                (
+                    "vram_delta",
+                    (snap1.vram_used as i64 - snap0.vram_used as i64).to_string(),
+                ),
                 ("modality", arch.modality().name().to_string()),
                 (
                     "capabilities",
-                    arch.capabilities().iter().map(|c| c.name()).collect::<Vec<_>>().join("+"),
+                    arch.capabilities()
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<Vec<_>>()
+                        .join("+"),
                 ),
             ],
         );
@@ -1641,7 +1891,12 @@ impl ModelManager {
     /// quantizers ship next to the gguf (the gguf metadata lacks several
     /// gemma4 text fields); weights flow through WTensor::Gguf — dp4a
     /// decode, slab-dequant prefill, PLE rows host-dequantized per token.
-    fn load_gguf_gemma4(&self, name: &str, dir: &std::path::Path, weights: crate::formats::gguf::GgufWeights) -> Res<LoadedModel> {
+    fn load_gguf_gemma4(
+        &self,
+        name: &str,
+        dir: &std::path::Path,
+        weights: crate::formats::gguf::GgufWeights,
+    ) -> Res<LoadedModel> {
         let cfg_path = dir.join("config.json");
         let raw = std::fs::read_to_string(&cfg_path).map_err(|_| {
             err!(
@@ -1650,8 +1905,14 @@ impl ModelManager {
                 cfg_path.display()
             )
         })?;
-        let j = json::parse(&raw)
-            .map_err(|e| err!("config", "{}/config.json is not valid JSON: {}", dir.display(), e))?;
+        let j = json::parse(&raw).map_err(|e| {
+            err!(
+                "config",
+                "{}/config.json is not valid JSON: {}",
+                dir.display(),
+                e
+            )
+        })?;
         let mut g4 = G4Config::parse(&j)?;
         // The rope recipe comes from the GGUF's own metadata, not the
         // config.json sidecar: the export's weights are consistent with the
@@ -1692,7 +1953,9 @@ impl ModelManager {
         let (wb, kvb, wsb) = Gemma4::forecast_bytes(&g4, &weights, &codec);
         crate::log::info(&format!(
             "gemma4-gguf forecast: {} weights + {} KV + {} workspace (PLE table stays in host RAM)",
-            crate::cuda::fmt_bytes(wb), crate::cuda::fmt_bytes(kvb), crate::cuda::fmt_bytes(wsb)
+            crate::cuda::fmt_bytes(wb),
+            crate::cuda::fmt_bytes(kvb),
+            crate::cuda::fmt_bytes(wsb)
         ));
         // PRODUCTION SAFETY: this path used to LOG the forecast and then
         // allocate regardless — announcing "does not fit" and trying anyway,
@@ -1702,7 +1965,12 @@ impl ModelManager {
             let transient = weights
                 .tensors()
                 .values()
-                .filter(|t| !matches!(t.dtype, crate::traits::DType::F16 | crate::traits::DType::U8))
+                .filter(|t| {
+                    !matches!(
+                        t.dtype,
+                        crate::traits::DType::F16 | crate::traits::DType::U8
+                    )
+                })
                 .filter(|t| {
                     !t.name.ends_with("embed_tokens_per_layer.weight")
                         && !t.name.contains("subsample_conv_projection.")
@@ -1711,7 +1979,12 @@ impl ModelManager {
                 .map(|t| t.numel() * t.dtype.size())
                 .max()
                 .unwrap_or(0);
-            let forecast = VramForecast { weights: wb, kv_cache: kvb, workspace: wsb, load_transient: transient };
+            let forecast = VramForecast {
+                weights: wb,
+                kv_cache: kvb,
+                workspace: wsb,
+                load_transient: transient,
+            };
             forecast.check(&self.ctx, name)?;
             VramForecast::host_guard(&weights, name)?;
         }
@@ -1720,13 +1993,17 @@ impl ModelManager {
         // the SentencePiece lineage via the <0xXX> byte-fallback tokens.
         let tokenizer = if dir.join("tokenizer.json").exists() {
             if std::env::var("CIMA_G4_DEBUG").is_ok() {
-                eprintln!("g4 tokenizer source: repo tokenizer.json (gguf-metadata synth as fallback)");
+                eprintln!(
+                    "g4 tokenizer source: repo tokenizer.json (gguf-metadata synth as fallback)"
+                );
             }
             BpeTokenizer::load(dir).or_else(|_| tokenizer_from_gguf_meta(&weights, true))?
         } else {
             // expected for gguf-only repos: synthesize from metadata
             if std::env::var("CIMA_G4_DEBUG").is_ok() {
-                eprintln!("g4 tokenizer source: synthesized from gguf metadata (no repo tokenizer.json)");
+                eprintln!(
+                    "g4 tokenizer source: synthesized from gguf metadata (no repo tokenizer.json)"
+                );
             }
             tokenizer_from_gguf_meta(&weights, true)?
         };
@@ -1753,14 +2030,40 @@ impl ModelManager {
                 }
                 cur
             };
-            g4.audio_token_id = resolve(g4.audio_token_id, &["<|audio|>", "<audio_soft_token>"], "audio_token_id");
-            g4.boa_token_id = resolve(g4.boa_token_id, &["<|audio>", "<start_of_audio>"], "boa_token_id");
-            g4.eoa_token_id = resolve(g4.eoa_token_id, &["<audio|>", "<end_of_audio>"], "eoa_token_id");
-            g4.image_token_id = resolve(g4.image_token_id, &["<|image|>", "<image_soft_token>"], "image_token_id");
-            g4.boi_token_id = resolve(g4.boi_token_id, &["<|image>", "<start_of_image>"], "boi_token_id");
-            g4.eoi_token_id = resolve(g4.eoi_token_id, &["<image|>", "<end_of_image>"], "eoi_token_id");
+            g4.audio_token_id = resolve(
+                g4.audio_token_id,
+                &["<|audio|>", "<audio_soft_token>"],
+                "audio_token_id",
+            );
+            g4.boa_token_id = resolve(
+                g4.boa_token_id,
+                &["<|audio>", "<start_of_audio>"],
+                "boa_token_id",
+            );
+            g4.eoa_token_id = resolve(
+                g4.eoa_token_id,
+                &["<audio|>", "<end_of_audio>"],
+                "eoa_token_id",
+            );
+            g4.image_token_id = resolve(
+                g4.image_token_id,
+                &["<|image|>", "<image_soft_token>"],
+                "image_token_id",
+            );
+            g4.boi_token_id = resolve(
+                g4.boi_token_id,
+                &["<|image>", "<start_of_image>"],
+                "boi_token_id",
+            );
+            g4.eoi_token_id = resolve(
+                g4.eoi_token_id,
+                &["<image|>", "<end_of_image>"],
+                "eoi_token_id",
+            );
         }
-        let chat_template = weights.meta_str("tokenizer.chat_template").map(str::to_owned);
+        let chat_template = weights
+            .meta_str("tokenizer.chat_template")
+            .map(str::to_owned);
         if std::env::var("CIMA_G4_DEBUG").is_ok() {
             // Full metadata dump: the export's hyperparameters are the graph
             // llama.cpp runs; any disagreement with the config.json-derived
@@ -1774,14 +2077,23 @@ impl ModelManager {
                 let shown = match v {
                     V::Arr(a) if a.len() > 8 => format!("[{} items]", a.len()),
                     V::Str(s) if s.chars().count() > 100 => {
-                        format!("{:?}… ({} chars)", s.chars().take(100).collect::<String>(), s.chars().count())
+                        format!(
+                            "{:?}… ({} chars)",
+                            s.chars().take(100).collect::<String>(),
+                            s.chars().count()
+                        )
                     }
                     other => format!("{:?}", other),
                 };
                 eprintln!("gguf meta {} = {}", k, shown);
             }
         }
-        let arch = Arch::Gemma4(Gemma4::build(self.ctx.clone(), g4, Box::new(weights), &codec)?);
+        let arch = Arch::Gemma4(Gemma4::build(
+            self.ctx.clone(),
+            g4,
+            Box::new(weights),
+            &codec,
+        )?);
         let media_token = MEDIA_LITERALS
             .iter()
             .find(|l| tokenizer.special(l).is_some())
@@ -1799,7 +2111,14 @@ impl ModelManager {
         })
     }
 
-    fn load_gguf(&self, name: &str, repo: &str, tag: Option<&str>, dir: PathBuf, ggufs: Vec<PathBuf>) -> Res<LoadedModel> {
+    fn load_gguf(
+        &self,
+        name: &str,
+        repo: &str,
+        tag: Option<&str>,
+        dir: PathBuf,
+        ggufs: Vec<PathBuf>,
+    ) -> Res<LoadedModel> {
         let t0 = Instant::now();
         let snap0 = self.ctx.snapshot();
         if ggufs.is_empty() {
@@ -1819,7 +2138,11 @@ impl ModelManager {
         // must not participate in tag resolution (mmproj-F16 would match
         // tag F16) — they merge into whichever quant is chosen, below.
         let is_mmproj = |p: &&std::path::PathBuf| {
-            p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase().contains("mmproj")
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("mmproj")
         };
         let chosen: Vec<&std::path::PathBuf> = match tag {
             Some(t) => {
@@ -1827,7 +2150,13 @@ impl ModelManager {
                 ggufs
                     .iter()
                     .filter(|p| !is_mmproj(p))
-                    .filter(|p| p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase().contains(&tl))
+                    .filter(|p| {
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .contains(&tl)
+                    })
                     .collect()
             }
             None => ggufs.iter().filter(|p| !is_mmproj(p)).collect(),
@@ -1838,20 +2167,29 @@ impl ModelManager {
                 return Err(err!(
                     "gguf",
                     "no .gguf in {} matches tag '{}'. Available: {}",
-                    dir.display(), tag.unwrap_or(""), quants.join(", ")
+                    dir.display(),
+                    tag.unwrap_or(""),
+                    quants.join(", ")
                 ))
             }
             many => {
                 // Prefer the shortest matching filename (Q4_K vs Q4_K_XL
                 // style overlaps resolve to the exact-most tag).
-                let exact = many.iter().min_by_key(|p| p.file_name().unwrap_or_default().len()).unwrap();
+                let exact = many
+                    .iter()
+                    .min_by_key(|p| p.file_name().unwrap_or_default().len())
+                    .unwrap();
                 if tag.is_none() {
                     return Err(err!(
                         "gguf",
                         "{} holds {} quantizations — pick one: {}",
                         repo,
                         many.len(),
-                        quants.iter().map(|q| format!("{}:{}", repo, crate::hub::quant_tag(q))).collect::<Vec<_>>().join(", ")
+                        quants
+                            .iter()
+                            .map(|q| format!("{}:{}", repo, crate::hub::quant_tag(q)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ));
                 }
                 (**exact).clone()
@@ -1871,11 +2209,19 @@ impl ModelManager {
             let mmprojs: Vec<&std::path::PathBuf> = ggufs
                 .iter()
                 .filter(|p| {
-                    p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase().contains("mmproj")
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("mmproj")
                 })
                 .collect();
             let rank = |p: &std::path::PathBuf| {
-                let n = p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+                let n = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
                 if n.contains("bf16") {
                     1 // bf16 → f16 conversion loses mantissa; prefer true f16
                 } else if n.contains("f16") {
@@ -1930,7 +2276,12 @@ impl ModelManager {
                     "model.embed_tokens_per_layer.weight",
                 ] {
                     if let Some(m) = weights.tensors().get(name) {
-                        eprintln!("g4 lm tensor: {} shape {:?} dtype {}", name, m.shape, m.dtype.name());
+                        eprintln!(
+                            "g4 lm tensor: {} shape {:?} dtype {}",
+                            name,
+                            m.shape,
+                            m.dtype.name()
+                        );
                     }
                 }
                 // Calibration fingerprints: the mmproj ships per-weight
@@ -1951,15 +2302,31 @@ impl ModelManager {
                 };
                 for layer in [0usize, 6] {
                     for stem in [
-                        "ffn_up", "ffn_down", "ffn_up_1", "ffn_down_1",
-                        "attn_q", "attn_k", "attn_v", "attn_out",
-                        "conv_pw1", "conv_pw2",
+                        "ffn_up",
+                        "ffn_down",
+                        "ffn_up_1",
+                        "ffn_down_1",
+                        "attn_q",
+                        "attn_k",
+                        "attn_v",
+                        "attn_out",
+                        "conv_pw1",
+                        "conv_pw2",
                     ] {
                         let base = format!("audio_tower.layers.{}.{}", layer, stem);
-                        let g = |suf: &str| scalar(&format!("{}.{}", base, suf)).map(|v| format!("{:+.3}", v)).unwrap_or_else(|| "—".into());
+                        let g = |suf: &str| {
+                            scalar(&format!("{}.{}", base, suf))
+                                .map(|v| format!("{:+.3}", v))
+                                .unwrap_or_else(|| "—".into())
+                        };
                         eprintln!(
                             "g4 calib L{} {:<10} in [{} .. {}]  out [{} .. {}]",
-                            layer, stem, g("input_min"), g("input_max"), g("output_min"), g("output_max")
+                            layer,
+                            stem,
+                            g("input_min"),
+                            g("input_max"),
+                            g("output_min"),
+                            g("output_max")
                         );
                     }
                 }
@@ -1968,7 +2335,8 @@ impl ModelManager {
                 }
             }
         }
-        if weights.architecture.starts_with("gemma4") || weights.architecture.starts_with("gemma3n") {
+        if weights.architecture.starts_with("gemma4") || weights.architecture.starts_with("gemma3n")
+        {
             return self.load_gguf_gemma4(name, &dir, weights);
         }
         let std_archs = ["qwen2", "llama", "mistral", "qwen3"];
@@ -2009,7 +2377,9 @@ impl ModelManager {
             ));
         }
         let tokenizer = tokenizer_from_gguf_meta(&weights, false)?;
-        let chat_template = weights.meta_str("tokenizer.chat_template").map(str::to_owned);
+        let chat_template = weights
+            .meta_str("tokenizer.chat_template")
+            .map(str::to_owned);
         if std::env::var("CIMA_G4_DEBUG").is_ok() {
             // Full metadata dump: the export's hyperparameters are the graph
             // llama.cpp runs; any disagreement with the config.json-derived
@@ -2023,7 +2393,11 @@ impl ModelManager {
                 let shown = match v {
                     V::Arr(a) if a.len() > 8 => format!("[{} items]", a.len()),
                     V::Str(s) if s.chars().count() > 100 => {
-                        format!("{:?}… ({} chars)", s.chars().take(100).collect::<String>(), s.chars().count())
+                        format!(
+                            "{:?}… ({} chars)",
+                            s.chars().take(100).collect::<String>(),
+                            s.chars().count()
+                        )
                     }
                     other => format!("{:?}", other),
                 };
@@ -2036,12 +2410,25 @@ impl ModelManager {
             "model_load",
             &[
                 ("model", name.to_string()),
-                ("load_ms", format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3)),
+                (
+                    "load_ms",
+                    format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3),
+                ),
                 ("vram_pre", snap0.vram_used.to_string()),
                 ("vram_post", snap1.vram_used.to_string()),
-                ("vram_delta", (snap1.vram_used as i64 - snap0.vram_used as i64).to_string()),
+                (
+                    "vram_delta",
+                    (snap1.vram_used as i64 - snap0.vram_used as i64).to_string(),
+                ),
                 ("modality", arch.modality().name().to_string()),
-                ("capabilities", arch.capabilities().iter().map(|c| c.name()).collect::<Vec<_>>().join("+")),
+                (
+                    "capabilities",
+                    arch.capabilities()
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<Vec<_>>()
+                        .join("+"),
+                ),
             ],
         );
         Ok(LoadedModel {
@@ -2063,7 +2450,10 @@ impl ModelManager {
 /// paths run through here). `add_bos_default` covers metadata that omits
 /// `add_bos_token`: SentencePiece-lineage exports (gemma) default to true,
 /// gpt2/byte-level exports to false.
-fn tokenizer_from_gguf_meta(w: &crate::formats::gguf::GgufWeights, add_bos_default: bool) -> Res<BpeTokenizer> {
+fn tokenizer_from_gguf_meta(
+    w: &crate::formats::gguf::GgufWeights,
+    add_bos_default: bool,
+) -> Res<BpeTokenizer> {
     let arr = |key: &str| w.meta.get(key).and_then(|v| v.as_arr());
     let tokens: Vec<String> = arr("tokenizer.ggml.tokens")
         .ok_or_else(|| err!("gguf", "metadata is missing tokenizer.ggml.tokens"))?
@@ -2071,16 +2461,30 @@ fn tokenizer_from_gguf_meta(w: &crate::formats::gguf::GgufWeights, add_bos_defau
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
     let merges: Vec<String> = arr("tokenizer.ggml.merges")
-        .map(|a| a.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect())
+        .map(|a| {
+            a.iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
         .unwrap_or_default();
     let types: Vec<i64> = arr("tokenizer.ggml.token_type")
-        .map(|a| a.iter().map(|v| v.as_u64().map(|u| u as i64).unwrap_or(1)).collect())
+        .map(|a| {
+            a.iter()
+                .map(|v| v.as_u64().map(|u| u as i64).unwrap_or(1))
+                .collect()
+        })
         .unwrap_or_default();
     let scores: Vec<f32> = arr("tokenizer.ggml.scores")
         .map(|a| a.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect())
         .unwrap_or_default();
-    let bos = w.meta_usize("tokenizer.ggml.bos_token_id").map(|v| v as u32);
-    let eos: Vec<u32> = w.meta_usize("tokenizer.ggml.eos_token_id").map(|e| e as u32).into_iter().collect();
+    let bos = w
+        .meta_usize("tokenizer.ggml.bos_token_id")
+        .map(|v| v as u32);
+    let eos: Vec<u32> = w
+        .meta_usize("tokenizer.ggml.eos_token_id")
+        .map(|e| e as u32)
+        .into_iter()
+        .collect();
     let add_bos = w
         .meta
         .get("tokenizer.ggml.add_bos_token")
@@ -2134,7 +2538,7 @@ mod sampler_tests {
         // Greedy must return the max-logit index regardless of buffer reuse
         // across repeated calls (the hoisted scratch must not leak state).
         let mut s = DefaultSampler::new(1);
-        let mut logits = vec![0.1f32, 0.5, 0.2, 0.9, 0.3];
+        let logits = vec![0.1f32, 0.5, 0.2, 0.9, 0.3];
         let o = opts(0.0, 1.0, 0);
         for _ in 0..8 {
             assert_eq!(s.sample(&mut logits.clone(), &[], &o), 3);
@@ -2153,9 +2557,13 @@ mod sampler_tests {
         assert_eq!(first, b.sample(&mut logits.clone(), &[], &o));
         // And a run of draws is reproducible under buffer reuse.
         let mut c = DefaultSampler::new(7);
-        let seq1: Vec<u32> = (0..16).map(|_| c.sample(&mut logits.clone(), &[], &o)).collect();
+        let seq1: Vec<u32> = (0..16)
+            .map(|_| c.sample(&mut logits.clone(), &[], &o))
+            .collect();
         let mut d = DefaultSampler::new(7);
-        let seq2: Vec<u32> = (0..16).map(|_| d.sample(&mut logits.clone(), &[], &o)).collect();
+        let seq2: Vec<u32> = (0..16)
+            .map(|_| d.sample(&mut logits.clone(), &[], &o))
+            .collect();
         assert_eq!(seq1, seq2);
     }
 

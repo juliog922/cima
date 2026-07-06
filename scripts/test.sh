@@ -24,10 +24,16 @@
 # =============================================================================
 set -uo pipefail
 
-# Compose file lives under docker/ (run these scripts from the repo root).
-# Exported so every `docker compose ...` below resolves it without -f.
-export COMPOSE_FILE="${COMPOSE_FILE:-../docker/docker-compose.yml}"
-cd "$(dirname "$0")"
+# Run from the repo root: the compose file and its build context are
+# repo-root-relative, and `docker compose` resolves COMPOSE_FILE from the
+# current directory. This script lives in scripts/, so the repo root is its
+# parent — cd there BEFORE anything reads COMPOSE_FILE.
+cd "$(dirname "$0")/.." || exit 1
+
+# Compose file lives under docker/ (paths are relative to the repo root we
+# just cd'd into). Exported so every `docker compose ...` below finds it
+# without an explicit -f.
+export COMPOSE_FILE="${COMPOSE_FILE:-docker/docker-compose.yml}"
 
 if [[ "${1:-}" != "--inner" ]]; then
   command -v docker >/dev/null || { echo "docker required in host mode"; exit 1; }
@@ -47,14 +53,15 @@ if [[ "${1:-}" != "--inner" ]]; then
   # otherwise turns into a silent liveness hang. Verify RUNNING; on
   # failure, print the dying container's own words and abort.
   sleep 3
-  for s in cima; do
-    if ! docker compose ps --status running "$s" | grep -q "$s"; then
-      echo "ERROR: service '$s' is not running — its log tail:"
-      docker compose logs --no-color --tail 40 "$s" || true
-      exit 1
-    fi
-  done
+  s=cima
+  if ! docker compose ps --status running "$s" | grep -q "$s"; then
+    echo "ERROR: service '$s' is not running — its log tail:"
+    docker compose logs --no-color --tail 40 "$s" || true
+    exit 1
+  fi
   docker compose --profile tools build bench
+  # The bench service's entrypoint is /bin/bash, so pass the script path as
+  # its argument (no `bash` prefix — that would make bash try to run `bash`).
   # scripts live under scripts/ relative to the /bench working_dir.
   docker compose --profile tools run --rm bench scripts/test.sh --inner
   exit $?

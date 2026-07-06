@@ -41,10 +41,16 @@
 # =============================================================================
 set -euo pipefail
 
-# Compose file lives under docker/ (run these scripts from the repo root).
-# Exported so every `docker compose ...` below resolves it without -f.
-export COMPOSE_FILE="${COMPOSE_FILE:-../docker/docker-compose.yml}"
-cd "$(dirname "$0")"
+# Run from the repo root: the compose file and its build context are
+# repo-root-relative, and `docker compose` resolves COMPOSE_FILE from the
+# current directory. This script lives in scripts/, so the repo root is its
+# parent — cd there BEFORE anything reads COMPOSE_FILE.
+cd "$(dirname "$0")/.." || exit 1
+
+# Compose file lives under docker/ (paths are relative to the repo root we
+# just cd'd into). Exported so every `docker compose ...` below finds it
+# without an explicit -f.
+export COMPOSE_FILE="${COMPOSE_FILE:-docker/docker-compose.yml}"
 
 GGUF_TEXT_CIMA="Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0"
 GGUF_TEXT_OLLAMA="qwen2.5:0.5b-instruct-q8_0"

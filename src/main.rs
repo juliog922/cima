@@ -315,7 +315,10 @@ fn dispatch(args: &[String]) -> Res<()> {
                     None => (model.clone(), None),
                 };
                 let n = vet::preflight_deep(&repo, tag.as_deref())?;
-                println!("preflight PASS: {} ({} tensors validated, no bytes of weights downloaded)", model, n);
+                println!(
+                    "preflight PASS: {} ({} tensors validated, no bytes of weights downloaded)",
+                    model, n
+                );
                 return Ok(());
             }
             let expected = args
@@ -420,7 +423,9 @@ fn cmd_serve(host: Option<String>, port: Option<String>) -> Res<()> {
         snap.util_gpu
     ));
     let models_dir = hub::models_dir();
-    let model_count = std::fs::read_dir(&models_dir).map(|r| r.count()).unwrap_or(0);
+    let model_count = std::fs::read_dir(&models_dir)
+        .map(|r| r.count())
+        .unwrap_or(0);
     log::info(&format!(
         "config: models_dir={} ({} entries) | keep_alive={} | max_seq={} | log={} format={} | hf_token={}",
         models_dir.display(),
@@ -1465,7 +1470,7 @@ fn cmd_logs(rest: &[String]) -> Res<()> {
         }
     }
 
-    let mut recs: Vec<_> = ring.read_since(0).into_iter().filter(|r| pass(r)).collect();
+    let mut recs: Vec<_> = ring.read_since(0).into_iter().filter(&pass).collect();
     if let Some(n) = last_n {
         let skip = recs.len().saturating_sub(n);
         recs.drain(..skip);
@@ -1485,11 +1490,7 @@ fn cmd_logs(rest: &[String]) -> Res<()> {
         let mut last = recs.last().map(|r| r.seq).unwrap_or(0);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let fresh: Vec<_> = ring
-                .read_since(last)
-                .into_iter()
-                .filter(|r| pass(r))
-                .collect();
+            let fresh: Vec<_> = ring.read_since(last).into_iter().filter(&pass).collect();
             for r in &fresh {
                 if table {
                     print_table(std::slice::from_ref(r));
@@ -1530,8 +1531,15 @@ fn cmd_ready(models: &[String], wait: bool, timeout_secs: u64) -> Res<()> {
                     if let Some(rows) = j.get("models").and_then(json::Json::as_arr) {
                         for m in rows {
                             let name = m.get("model").and_then(json::Json::as_str).unwrap_or("?");
-                            let present = m.get("present").and_then(json::Json::as_bool).unwrap_or(false);
-                            println!("  {:<48} {}", name, if present { "present" } else { "MISSING" });
+                            let present = m
+                                .get("present")
+                                .and_then(json::Json::as_bool)
+                                .unwrap_or(false);
+                            println!(
+                                "  {:<48} {}",
+                                name,
+                                if present { "present" } else { "MISSING" }
+                            );
                         }
                     }
                     return Err(cima::err!("cli", "not ready"));
@@ -1622,11 +1630,10 @@ fn cmd_rm(model: Option<&String>) -> Res<()> {
     // Linux unlink leaves the mmapped inode alive until unmapped. Tag
     // matching is identical to `run`: case-insensitive filename substring,
     // mmproj excluded.
-    if tag.is_none()
-        && api::client::Client::local().delete_quiet(model) {
-            println!("deleted {} (via server: evicted from VRAM first)", model);
-            return Ok(());
-        }
+    if tag.is_none() && api::client::Client::local().delete_quiet(model) {
+        println!("deleted {} (via server: evicted from VRAM first)", model);
+        return Ok(());
+    }
     let dir = hub::local_dir(repo);
     // Legacy layout: older pulls encoded the tag into the directory name
     // (`repo@tag`, one dir per quant). A tagged rm whose repo dir is absent

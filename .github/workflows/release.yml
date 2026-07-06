@@ -61,7 +61,7 @@ jobs:
         run: |
           docker compose up -d --build cima
           docker compose exec -T cima cima selftest
-          ./scripts/test.sh
+          bash scripts/test.sh
       - name: Teardown
         if: always()
         run: docker compose down -v --remove-orphans || true

@@ -263,11 +263,9 @@ pub fn is_gguf_block(dtype: DType) -> bool {
 /// so callers can divide unconditionally.
 pub fn block_elems(dtype: DType) -> usize {
     match dtype {
-        DType::GgufQ8_0
-        | DType::GgufQ4_0
-        | DType::GgufQ4_1
-        | DType::GgufQ5_0
-        | DType::GgufQ5_1 => 32,
+        DType::GgufQ8_0 | DType::GgufQ4_0 | DType::GgufQ4_1 | DType::GgufQ5_0 | DType::GgufQ5_1 => {
+            32
+        }
         DType::GgufQ4K | DType::GgufQ5K | DType::GgufQ6K | DType::GgufIQ4XS => 256,
         _ => 1,
     }
