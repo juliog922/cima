@@ -44,7 +44,7 @@ set -euo pipefail
 # Compose file lives under docker/ (run these scripts from the repo root).
 # Exported so every `docker compose ...` below resolves it without -f.
 export COMPOSE_FILE="${COMPOSE_FILE:-../docker/docker-compose.yml}"
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 GGUF_TEXT_CIMA="Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0"
 GGUF_TEXT_OLLAMA="qwen2.5:0.5b-instruct-q8_0"

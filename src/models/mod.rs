@@ -2538,7 +2538,7 @@ mod sampler_tests {
         // Greedy must return the max-logit index regardless of buffer reuse
         // across repeated calls (the hoisted scratch must not leak state).
         let mut s = DefaultSampler::new(1);
-        let mut logits = vec![0.1f32, 0.5, 0.2, 0.9, 0.3];
+        let logits = vec![0.1f32, 0.5, 0.2, 0.9, 0.3];
         let o = opts(0.0, 1.0, 0);
         for _ in 0..8 {
             assert_eq!(s.sample(&mut logits.clone(), &[], &o), 3);
