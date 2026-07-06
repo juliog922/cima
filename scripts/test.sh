@@ -60,8 +60,10 @@ if [[ "${1:-}" != "--inner" ]]; then
     exit 1
   fi
   docker compose --profile tools build bench
+  # The bench service's entrypoint is /bin/bash, so pass the script path as
+  # its argument (no `bash` prefix — that would make bash try to run `bash`).
   # scripts live under scripts/ relative to the /bench working_dir.
-  docker compose --profile tools run --rm bench bash scripts/test.sh --inner
+  docker compose --profile tools run --rm bench scripts/test.sh --inner
   exit $?
 fi
 
