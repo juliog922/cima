@@ -1,0 +1,14 @@
+# Keep the build context to sources only: a stray models/ directory adds
+# gigabytes to every docker build and can leak private weights into layers.
+target/
+models/
+logs/
+bench-results.csv
+*.wav
+*.mp3
+*.jpg
+*.png
+.git/
+.github/
+docs/
+examples/

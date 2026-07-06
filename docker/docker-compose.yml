@@ -1,0 +1,56 @@
+# cima bench/test harness — engines under identical GPU conditions.
+#   docker compose up -d cima ollama
+#   ./scripts/benchs.sh      (self-orchestrating from the host)
+#   ./scripts/test.sh
+# Everything is torn down and volumes removed by the scripts' cleanup trap.
+# HERMETIC BY DESIGN: no service publishes ports to the host. The bench
+# runner reaches engines via compose DNS (cima:11435,
+# ollama:11434), so natively-running engines on the host keep their ports
+# without conflict. For ad-hoc poking use the network from inside:
+#   docker compose run --rm bench curl -s cima:11435/api/tags
+#
+# init: true puts tini in as PID 1 — without it the engine binary IS
+# PID 1, silently drops SIGTERM, and every stop escalates to SIGKILL
+# after the grace period (field-observed as a 34s hang on `down`).
+
+services:
+  cima:
+    init: true
+    # Harness scripts live under scripts/ (run from the repo root):
+    # ./scripts/test.sh, ./scripts/benchs.sh
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    volumes: ["cima-models:/app/models"]
+    # CIMA_KEEP_ALIVE: default residency window after each request
+    # (e.g. 600, 90s, 10m, 2h, 0, forever) — unset = 5 minutes.
+    environment: [CIMA_HOST=0.0.0.0, HF_TOKEN, CIMA_KEEP_ALIVE]
+    gpus: all
+    # GPU faults that survive in-process context reset end in exit(86);
+    # on-failure restarts exactly those — but unlike unless-stopped it does
+    # not resurrect containers at daemon/WSL boot after an interrupted run.
+    restart: on-failure
+
+  ollama:
+    init: true
+    image: ollama/ollama:latest
+    volumes: ["ollama-models:/root/.ollama"]
+    gpus: all
+    # GPU faults that survive in-process context reset end in exit(86);
+    # on-failure restarts exactly those — but unlike unless-stopped it does
+    # not resurrect containers at daemon/WSL boot after an interrupted run.
+    restart: on-failure
+
+  # the runner: scripts execute in here, attacking engines by DNS name.
+  bench:
+    init: true
+    build: {context: .., dockerfile: docker/Dockerfile.bench}
+    profiles: ["tools"]
+    volumes: ["..:/bench", "bench-assets:/assets"]
+    working_dir: /bench
+    entrypoint: ["/bin/bash"]
+
+volumes:
+  cima-models:
+  ollama-models:
+  bench-assets:

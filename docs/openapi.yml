@@ -1,0 +1,978 @@
+openapi: 3.1.0
+info:
+  title: cima inference engine API
+  version: 0.1.0
+  summary: Ollama-compatible REST API for the cima CUDA inference engine.
+  description: >
+    cima is a from-scratch, zero-dependency Rust/CUDA LLM inference engine that
+    serves Hugging Face repositories directly and speaks an Ollama-compatible
+    wire protocol, so existing Ollama clients work against it unchanged.
+
+
+    ## Conventions
+
+
+    - All request and response bodies are JSON (`application/json`) unless a
+      streaming response is requested, in which case the body is newline-
+      delimited JSON (`application/x-ndjson`): one JSON object per line.
+
+    - Duration fields in generate/chat/embed responses are **nanoseconds**
+      (Ollama's convention), named `*_duration`.
+
+    - Model names are Hugging Face selectors: `ORG/REPO` for safetensors
+      checkpoints, or `ORG/REPO:TAG` where `TAG` selects a GGUF quantization
+      (e.g. `unsloth/gemma-4-E2B-it-GGUF:Q4_K_M`).
+
+    - The server is **stateless per request**: it holds no conversation
+      history. Clients must send the full message history on every `/api/chat`
+      call.
+
+    - Request bodies are capped at **64 MiB** (base64 media inflates ~33%, so
+      keep raw media under ~45 MiB).
+
+    - A single model is resident on the GPU at a time; a request naming a
+      different model evicts and loads. The optional request queue (see
+      `CIMA_MAX_QUEUE`) returns `429` instead of blocking when full.
+
+
+    ## Errors
+
+
+    Every non-streaming error is a JSON object `{"error": "<message>"}` with an
+    appropriate HTTP status. Streaming responses that fail after headers are
+    sent emit a final NDJSON frame `{"error": "<message>"}`.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:11435
+    description: Default local bind (CIMA_HOST / CIMA_PORT).
+
+tags:
+  - name: Generation
+    description: Text and multimodal generation, chat, embeddings.
+  - name: Models
+    description: List, inspect, pull, and delete local models.
+  - name: Health
+    description: Liveness, readiness, resident-model status, version.
+
+paths:
+  /:
+    get:
+      tags: [Health]
+      summary: Liveness probe (plain text)
+      description: Returns a fixed plain-text banner. Also responds to HEAD.
+      responses:
+        "200":
+          description: Server is running.
+          content:
+            text/plain:
+              schema: { type: string, example: "Inferno is running" }
+    head:
+      tags: [Health]
+      summary: Liveness probe (headers only)
+      responses:
+        "200": { description: Server is running. }
+
+  /api/version:
+    get:
+      tags: [Health]
+      summary: Report the compatible Ollama version and engine identity
+      description: >
+        `version` is a bare Ollama semver that Ollama clients parse to gate
+        features (never a prerelease suffix). `engine` names the real server.
+        Override the reported Ollama version with the `CIMA_OLLAMA_VERSION`
+        environment variable.
+      responses:
+        "200":
+          description: Version info.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, engine]
+                properties:
+                  version:
+                    type: string
+                    description: Ollama-compatible semver.
+                    example: "0.6.0"
+                  engine:
+                    type: string
+                    example: "cima 0.1.0"
+
+  /api/ready:
+    get:
+      tags: [Health]
+      summary: Readiness / liveness snapshot
+      description: >
+        Liveness form. Returns overall health plus the list of models present
+        on disk. When `CIMA_PULL_AT_STARTUP` is configured, additional
+        `startup_*` fields report the background pull progress and `ready` is
+        false until every required model is present. HTTP status is `200` when
+        ready, `503` while a dependent should keep waiting.
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyLiveness" }
+        "503":
+          description: Not ready (startup pull in progress, failed, or unhealthy).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyLiveness" }
+    post:
+      tags: [Health]
+      summary: Check readiness for a specific set of models
+      description: >
+        Readiness form. Reports per-model presence and an overall `ready`
+        boolean gated on those models. `200` when all requested models are
+        present and the server is healthy, else `503`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                models:
+                  type: array
+                  items: { type: string }
+                  example: ["unsloth/gemma-4-E2B-it-GGUF:Q4_K_M"]
+      responses:
+        "200":
+          description: All requested models present.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyModels" }
+        "503":
+          description: One or more requested models absent (or unhealthy).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyModels" }
+
+  /api/ps:
+    get:
+      tags: [Health]
+      summary: List the resident model and queue depth
+      responses:
+        "200":
+          description: Resident-model status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models, queue_depth]
+                properties:
+                  models:
+                    type: array
+                    description: Zero or one entry (a single model is resident).
+                    items: { $ref: "#/components/schemas/PsEntry" }
+                  queue_depth:
+                    type: integer
+                    description: Requests currently waiting/holding the GPU permit.
+                    example: 0
+
+  /api/available:
+    get:
+      tags: [Models]
+      summary: List curated, pull-ready models (the hub catalog)
+      description: >
+        The curated registry of vetted models that can be pulled — the HTTP
+        twin of the `cima available` CLI. Distinct from `/api/tags`, which
+        lists only what is already on local disk. Each entry carries a `local`
+        flag indicating whether it is already downloaded.
+      responses:
+        "200":
+          description: Curated catalog.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models]
+                properties:
+                  models:
+                    type: array
+                    items: { $ref: "#/components/schemas/AvailableEntry" }
+
+  /api/tags:
+    get:
+      tags: [Models]
+      summary: List models available on local disk
+      responses:
+        "200":
+          description: Local model list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models]
+                properties:
+                  models:
+                    type: array
+                    items: { $ref: "#/components/schemas/TagEntry" }
+
+  /api/show:
+    post:
+      tags: [Models]
+      summary: Show details of one local model
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Accepts `model` or the alias `name`.
+              properties:
+                model: { type: string }
+                name: { type: string }
+              example: { model: "Qwen/Qwen2.5-0.5B-Instruct" }
+      responses:
+        "200":
+          description: Model detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShowResponse" }
+        "400":
+          $ref: "#/components/responses/MissingModel"
+        "404":
+          description: Model not present locally.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/pull:
+    post:
+      tags: [Models]
+      summary: Download a model from Hugging Face (streaming status)
+      description: >
+        Streams newline-delimited JSON status frames as the download proceeds
+        and finishes with `{"status":"success"}`. On failure a frame
+        `{"error":"..."}` is emitted. A `:TAG` selects a GGUF quantization and
+        the matching `mmproj-*.gguf` sidecar (vision/audio towers) is fetched
+        alongside it automatically.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model:
+                  type: string
+                  description: Accepts `model` or the alias `name`.
+                  example: "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M"
+                name: { type: string }
+                include:
+                  type: string
+                  description: Optional filename filter (overrides the `:TAG` filter).
+                force:
+                  type: boolean
+                  default: false
+                  description: Re-download even if already present.
+      responses:
+        "200":
+          description: NDJSON stream of status frames.
+          content:
+            application/x-ndjson:
+              schema: { $ref: "#/components/schemas/PullStatusFrame" }
+              examples:
+                progress:
+                  summary: Typical sequence
+                  value: |
+                    {"status":"pulling manifest"}
+                    {"status":"preflight ok"}
+                    {"status":"success"}
+        "400":
+          $ref: "#/components/responses/MissingModel"
+
+  /api/delete:
+    post:
+      tags: [Models]
+      summary: Delete a model from local disk
+      description: >
+        Removes the model's snapshot directory (evicting it from the GPU first
+        if resident). Also accepts DELETE with the same body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: string }
+              example: { model: "Qwen/Qwen2.5-0.5B-Instruct" }
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "deleted" }
+        "400":
+          $ref: "#/components/responses/MissingModel"
+        "404":
+          description: Model not on local disk.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: Deletion failed (filesystem error).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Models]
+      summary: Delete a model from local disk (DELETE verb)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: string }
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "deleted" }
+        "400": { $ref: "#/components/responses/MissingModel" }
+        "404":
+          description: Model not on local disk.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: Deletion failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/generate:
+    post:
+      tags: [Generation]
+      summary: Generate a completion for a prompt
+      description: >
+        Text and multimodal completion. With `stream:true` (the default) the
+        response is an NDJSON stream of chunks ending in a final chunk with
+        timing metadata; with `stream:false` the whole reply is one JSON
+        object. An empty `prompt` triggers Ollama's load/unload idiom (loads
+        the model, or unloads it when `keep_alive:0`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GenerateRequest" }
+      responses:
+        "200":
+          description: >
+            Completion. Content type depends on `stream`: a single JSON object
+            (`stream:false`) or an NDJSON stream (`stream:true`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerateResponse" }
+            application/x-ndjson:
+              schema: { $ref: "#/components/schemas/GenerateStreamChunk" }
+        "400":
+          $ref: "#/components/responses/MissingModel"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          description: Model load or inference error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/chat:
+    post:
+      tags: [Generation]
+      summary: Generate the next chat message
+      description: >
+        Same execution path as `/api/generate` but takes a `messages` array and
+        returns a `message` object. Stateless: send the full history each turn.
+        Supports `tools` for function-calling; when the model emits a tool call
+        the response `message` carries a `tool_calls` array instead of content.
+        An empty `messages` array triggers the load/unload idiom.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatRequest" }
+      responses:
+        "200":
+          description: >
+            Chat reply. A single JSON object (`stream:false`) or an NDJSON
+            stream (`stream:true`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatResponse" }
+            application/x-ndjson:
+              schema: { $ref: "#/components/schemas/ChatStreamChunk" }
+        "400":
+          $ref: "#/components/responses/MissingModel"
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          description: Model load or inference error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/embed:
+    post:
+      tags: [Generation]
+      summary: Compute embeddings (current API)
+      description: >
+        Accepts a single string or an array of strings in `input` and returns a
+        parallel array of embedding vectors.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmbedRequest" }
+      responses:
+        "200":
+          description: Embeddings.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmbedResponse" }
+        "400":
+          description: Missing model, missing input, or non-string array element.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Model not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          description: Embedding computation error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/embeddings:
+    post:
+      tags: [Generation]
+      summary: Compute a single embedding (legacy API)
+      description: >
+        Legacy endpoint. Takes a single `prompt` string and returns one
+        `embedding` vector.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              properties:
+                model: { type: string }
+                prompt: { type: string }
+                keep_alive: { $ref: "#/components/schemas/KeepAlive" }
+              example: { model: "Qwen/Qwen2.5-0.5B-Instruct", prompt: "hello world" }
+      responses:
+        "200":
+          description: Single embedding.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [embedding]
+                properties:
+                  embedding:
+                    type: array
+                    items: { type: number, format: float }
+        "400":
+          description: Missing model or prompt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Model not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          $ref: "#/components/responses/QueueFull"
+        "500":
+          description: Embedding computation error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/create:
+    post:
+      tags: [Models]
+      summary: Not implemented
+      description: >
+        cima serves Hugging Face repositories directly and has no Modelfile
+        layer. Always returns 501.
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+  /api/copy:
+    post:
+      tags: [Models]
+      summary: Not implemented
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+  /api/push:
+    post:
+      tags: [Models]
+      summary: Not implemented
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+  /api/blobs/{digest}:
+    parameters:
+      - name: digest
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Models]
+      summary: Not implemented
+      description: cima has no blob store; weights are Hugging Face snapshots. Returns 501.
+      responses:
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+components:
+  responses:
+    MissingModel:
+      description: Required field `model` missing (or other request-validation failure).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "missing required field 'model'" }
+    QueueFull:
+      description: Request queue is full (CIMA_MAX_QUEUE); retry later.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "server busy: request queue is full (CIMA_MAX_QUEUE)" }
+    NotImplemented:
+      description: Endpoint intentionally unsupported; the message explains why.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: "not implemented: cima serves Hugging Face repositories directly (no Modelfile layer); use `cima pull ORG/REPO`"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+      example: { error: "model 'nope/x' not found — run `cima pull nope/x`" }
+
+    KeepAlive:
+      description: >
+        How long to keep the model resident after this request. Accepts a
+        duration string ("5m", "1h"), a number of seconds, or 0 to unload
+        immediately. Omitted uses the server default (CIMA_KEEP_ALIVE, 5m).
+      oneOf:
+        - type: string
+          example: "5m"
+        - type: integer
+          example: 0
+
+    Options:
+      type: object
+      description: Generation parameters (Ollama `options` object). All optional.
+      properties:
+        temperature:
+          type: number
+          format: float
+          default: 0.8
+          description: 0 = greedy/deterministic; higher = more random.
+        top_p:
+          type: number
+          format: float
+          default: 0.9
+        top_k:
+          type: integer
+          default: 40
+        seed:
+          type: integer
+          format: int64
+          default: 12648430
+          description: RNG seed; with fixed temperature makes sampling reproducible.
+        num_predict:
+          type: integer
+          default: 1024
+          description: Max tokens to generate. Negative values are ignored.
+        repeat_penalty:
+          type: number
+          format: float
+          default: 1.1
+        stop:
+          description: Stop sequence(s). Generation halts before emitting a match.
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+      additionalProperties: true
+
+    Format:
+      description: >
+        Structured-output control. `"json"` constrains decoding to
+        syntactically valid JSON. A JSON-Schema object applies the same
+        constraint plus injects the schema to steer key/type conformance.
+        Note: with a small `num_predict` a constrained response can hit the
+        token cap mid-object (a valid prefix that is not yet a closeable
+        object).
+      oneOf:
+        - type: string
+          enum: ["json"]
+        - type: object
+          description: A JSON Schema.
+
+    Message:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+        images:
+          type: array
+          description: Per-message base64 media (standard base64, no data-URI prefix).
+          items: { type: string, format: byte }
+        tool_calls:
+          type: array
+          items: { $ref: "#/components/schemas/ToolCall" }
+
+    ToolCall:
+      type: object
+      properties:
+        function:
+          type: object
+          properties:
+            name: { type: string }
+            arguments:
+              type: object
+              additionalProperties: true
+
+    GenerateRequest:
+      type: object
+      required: [model]
+      properties:
+        model:
+          type: string
+          example: "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M"
+        prompt:
+          type: string
+          description: Empty (or omitted) triggers the load/unload idiom.
+        stream:
+          type: boolean
+          default: true
+        images:
+          type: array
+          description: >
+            Base64-encoded images (standard base64, no data-URI). The engine
+            inserts the media placeholder automatically.
+          items: { type: string, format: byte }
+        audio:
+          type: array
+          description: Base64-encoded audio clips (WAV/MP3).
+          items: { type: string, format: byte }
+        format: { $ref: "#/components/schemas/Format" }
+        keep_alive: { $ref: "#/components/schemas/KeepAlive" }
+        options: { $ref: "#/components/schemas/Options" }
+
+    ChatRequest:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string }
+        messages:
+          type: array
+          description: Full conversation history (the server is stateless).
+          items: { $ref: "#/components/schemas/Message" }
+        stream:
+          type: boolean
+          default: true
+        tools:
+          type: array
+          description: Function-calling tool definitions (chat only).
+          items:
+            type: object
+            additionalProperties: true
+        format: { $ref: "#/components/schemas/Format" }
+        keep_alive: { $ref: "#/components/schemas/KeepAlive" }
+        options: { $ref: "#/components/schemas/Options" }
+
+    Timing:
+      type: object
+      description: Timing/token metadata (durations in nanoseconds).
+      properties:
+        total_duration: { type: integer, format: int64 }
+        load_duration: { type: integer, format: int64 }
+        prompt_eval_count: { type: integer }
+        prompt_eval_duration: { type: integer, format: int64 }
+        eval_count: { type: integer }
+        eval_duration: { type: integer, format: int64 }
+
+    GenerateResponse:
+      description: Non-streaming (`stream:false`) generate response.
+      allOf:
+        - type: object
+          required: [model, created_at, response, done]
+          properties:
+            model: { type: string }
+            created_at: { type: string, format: date-time }
+            response:
+              type: string
+              description: The full generated text.
+            done: { type: boolean, enum: [true] }
+            done_reason:
+              type: string
+              enum: [stop, length, unload]
+        - $ref: "#/components/schemas/Timing"
+
+    GenerateStreamChunk:
+      description: One NDJSON frame of a streaming generate response.
+      allOf:
+        - type: object
+          required: [model, created_at, response, done]
+          properties:
+            model: { type: string }
+            created_at: { type: string, format: date-time }
+            response:
+              type: string
+              description: Incremental text piece (empty on the final frame).
+            done:
+              type: boolean
+              description: True only on the final frame.
+            done_reason:
+              type: string
+              enum: [stop, length, unload]
+              description: Present on the final frame.
+        - $ref: "#/components/schemas/Timing"
+
+    ChatResponse:
+      description: Non-streaming (`stream:false`) chat response.
+      allOf:
+        - type: object
+          required: [model, created_at, message, done]
+          properties:
+            model: { type: string }
+            created_at: { type: string, format: date-time }
+            message: { $ref: "#/components/schemas/Message" }
+            done: { type: boolean, enum: [true] }
+            done_reason:
+              type: string
+              enum: [stop, length, unload]
+        - $ref: "#/components/schemas/Timing"
+
+    ChatStreamChunk:
+      description: One NDJSON frame of a streaming chat response.
+      allOf:
+        - type: object
+          required: [model, created_at, message, done]
+          properties:
+            model: { type: string }
+            created_at: { type: string, format: date-time }
+            message:
+              type: object
+              properties:
+                role: { type: string, enum: [assistant] }
+                content: { type: string, description: "Incremental piece." }
+            done: { type: boolean }
+            done_reason: { type: string, enum: [stop, length, unload] }
+        - $ref: "#/components/schemas/Timing"
+
+    EmbedRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string }
+        input:
+          description: A single string or an array of strings.
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+        keep_alive: { $ref: "#/components/schemas/KeepAlive" }
+      example:
+        model: "Qwen/Qwen2.5-0.5B-Instruct"
+        input: ["hello world", "goodbye world"]
+
+    EmbedResponse:
+      type: object
+      required: [model, embeddings]
+      properties:
+        model: { type: string }
+        embeddings:
+          type: array
+          description: One vector per input, in order.
+          items:
+            type: array
+            items: { type: number, format: float }
+        total_duration: { type: integer, format: int64 }
+
+    PsEntry:
+      type: object
+      properties:
+        name: { type: string }
+        model: { type: string }
+        size_vram:
+          type: integer
+          description: VRAM bytes held by the resident model.
+        expires_in:
+          description: Seconds until keep-alive eviction, or "forever".
+          oneOf:
+            - type: integer
+            - type: string
+              enum: [forever]
+        modality:
+          type: string
+          description: e.g. "text", "textvisionaudio".
+
+    AvailableEntry:
+      type: object
+      description: One curated, pull-ready model from the registry.
+      properties:
+        id:
+          type: string
+          description: Pull selector (ORG/REPO or ORG/REPO:TAG).
+        model:
+          type: string
+          description: Alias of id.
+        family:
+          type: string
+          example: gemma4
+        size:
+          type: string
+          description: Human-readable on-disk size, e.g. "3.8 GiB".
+        capabilities:
+          type: string
+          example: "generate+vision+audio"
+        status:
+          type: string
+          enum: [verified, experimental, avoid]
+        notes:
+          type: string
+          description: Vetting notes / caveats.
+        local:
+          type: boolean
+          description: True if already present on local disk.
+
+    TagEntry:
+      type: object
+      properties:
+        name: { type: string }
+        model: { type: string }
+        size:
+          type: integer
+          description: On-disk size in bytes.
+        digest:
+          type: string
+          description: Always empty (cima has no blob digests).
+        modified_at:
+          type: string
+          description: Unix seconds as a string.
+        details:
+          type: object
+          properties:
+            format:
+              type: string
+              enum: [gguf, safetensors]
+            family:
+              type: string
+              description: Capabilities, e.g. "text" or "text+vision+audio".
+
+    ShowResponse:
+      type: object
+      properties:
+        modelfile:
+          type: string
+          description: Synthetic; a comment pointing at the source HF repo.
+        parameters:
+          type: string
+          description: Empty (no Modelfile parameter block).
+        template:
+          type: string
+          description: The checkpoint's chat template, as shipped.
+        details:
+          type: object
+          properties:
+            format: { type: string }
+            family: { type: string }
+        model_info:
+          type: object
+          description: The model's config.json (empty object for GGUF checkpoints).
+          additionalProperties: true
+
+    ReadyLiveness:
+      type: object
+      required: [healthy, ready, models_present]
+      properties:
+        healthy:
+          type: boolean
+          description: Server serving and model-manager lock reachable.
+        ready:
+          type: boolean
+          description: healthy AND (no startup pull required OR it completed).
+        models_present:
+          type: array
+          items: { type: string }
+        startup_pull:
+          type: boolean
+          description: Present only when CIMA_PULL_AT_STARTUP is set.
+        startup_complete:
+          type: boolean
+          description: Present only when a startup pull is configured.
+        startup_phase:
+          type: string
+          description: 'Human-readable phase, e.g. "pulling 2/3: org/repo:tag".'
+        error:
+          type: string
+          description: Present when the startup pull failed.
+
+    ReadyModels:
+      type: object
+      required: [healthy, ready, models]
+      properties:
+        healthy: { type: boolean }
+        ready:
+          type: boolean
+          description: healthy AND all requested models present AND no startup failure.
+        models:
+          type: array
+          items:
+            type: object
+            properties:
+              model: { type: string }
+              present: { type: boolean }
+        error:
+          type: string
+          description: Present when a startup pull failed.
+
+    PullStatusFrame:
+      type: object
+      description: One NDJSON frame of a pull stream.
+      properties:
+        status:
+          type: string
+          description: e.g. "pulling manifest", "preflight ok", "success".
+        error:
+          type: string
+          description: Present on a failed frame.

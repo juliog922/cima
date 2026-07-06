@@ -1,0 +1,49 @@
+[package]
+name = "cima"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "Minimalist, zero-dependency CUDA inference engine with an Ollama-compatible API"
+authors = ["cima contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/OWNER/cima"
+keywords = ["llm", "inference", "cuda", "gguf", "gpu"]
+categories = ["command-line-utilities", "science"]
+readme = "README.md"
+
+[lib]
+name = "cima"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cima"
+path = "src/main.rs"
+
+# Zero dependencies is a project invariant — see CONTRIBUTING.md.
+[dependencies]
+
+# Examples are explicit targets so `cargo run --example NAME` and
+# `cargo build --examples` (CI Lane A) find them by name. Each connects to
+# a running `cima serve` over the Ollama API; see the header of each file
+# for prerequisites.
+[[example]]
+name = "generate"
+path = "examples/generate.rs"
+
+[[example]]
+name = "chat_stream"
+path = "examples/chat_stream.rs"
+
+[[example]]
+name = "embeddings"
+path = "examples/embeddings.rs"
+
+[[example]]
+name = "pull_and_vet"
+path = "examples/pull_and_vet.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

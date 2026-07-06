@@ -1,0 +1,46 @@
+# =============================================================================
+# Deployment example: cima as an inference engine that other services wait on.
+#
+# cima pulls the models named in CIMA_PULL_AT_STARTUP before it reports
+# healthy. `/api/ready` returns 503 until the server is live AND every listed
+# model is on disk, and the container HEALTHCHECK polls exactly that — so any
+# dependent using `condition: service_healthy` starts only once the models
+# are present. No polling scripts, no race on first request.
+#
+#   docker compose -f docker/docker-compose.example.yml up
+# =============================================================================
+
+services:
+  cima:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # Or: image: ghcr.io/OWNER/cima:latest
+    gpus: all
+    environment:
+      # Comma-separated ORG/REPO[:TAG]. Pulled at startup; the server is not
+      # healthy until all are local. Bad entries (typo, gated without a
+      # token) are retried with backoff, then reported as ready:false with an
+      # error — the container stays unhealthy instead of hanging forever.
+      CIMA_PULL_AT_STARTUP: "Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0"
+      # Gated/private repos need a token for the startup pull:
+      # HF_TOKEN: "hf_xxx"
+    volumes:
+      # Persist weights so a restart reaches ready almost immediately
+      # (already-present models are skipped).
+      - cima-models:/data/models
+    ports:
+      - "11435:11435"
+
+  # Any dependent service: it will not start until cima is healthy, i.e.
+  # until every startup model has been pulled.
+  app:
+    image: your-app:latest
+    depends_on:
+      cima:
+        condition: service_healthy
+    environment:
+      CIMA_URL: "http://cima:11435"
+
+volumes:
+  cima-models:

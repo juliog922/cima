@@ -1,0 +1,55 @@
+# =============================================================================
+# models-nightly — re-certify the registry metadata every night.
+#
+# `cima vet --preflight` validates each row's architecture, tokenizer, and
+# complete tensor table over HTTP Range requests (no weights downloaded,
+# no GPU needed). Upstream re-uploads that silently change a checkpoint
+# fail HERE, not on a user's rented A100. One rotating row additionally
+# gets the full on-GPU battery on the self-hosted runner.
+# =============================================================================
+name: models-nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  preflight-sweep:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.83"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build --release --locked
+      - name: Preflight every registry row
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          fail=0
+          # registry.toml: one [[model]] per row with repo = "ORG/REPO[:TAG]"
+          grep -oP 'repo\s*=\s*"\K[^"]+' registry.toml | while read -r m; do
+            echo "== preflight $m"
+            ./target/release/cima vet "$m" --preflight || fail=1
+          done
+          exit $fail
+
+  full-vet-rotating:
+    if: github.repository_owner != ''   # runs only where the runner exists
+    runs-on: [self-hosted, gpu]
+    needs: preflight-sweep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full battery on one rotating registry row
+        run: |
+          row=$(( $(date +%j) % $(grep -c '^\[\[model\]\]' registry.toml) + 1 ))
+          m=$(grep -oP 'repo\s*=\s*"\K[^"]+' registry.toml | sed -n "${row}p")
+          echo "== full vet: $m"
+          docker compose up -d --build cima
+          docker compose exec -T cima cima vet "$m"
+      - name: Teardown
+        if: always()
+        run: docker compose down -v --remove-orphans || true

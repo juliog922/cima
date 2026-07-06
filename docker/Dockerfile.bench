@@ -1,0 +1,7 @@
+# Bench/test runner image: the harness scripts execute in here and attack
+# the engines by compose DNS name. Tools only — no GPU, no cima binary.
+FROM debian:12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl jq python3 ffmpeg espeak-ng ca-certificates bc \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /bench

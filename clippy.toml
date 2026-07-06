@@ -1,0 +1,8 @@
+# Lint law is `cargo clippy --all-targets -- -D warnings` in CI.
+# Threshold tweaks live here so local runs match CI exactly.
+#
+# 16 accommodates the attention kernel launch wrappers (attn_prefill takes
+# 15): each argument is a distinct kernel parameter — q/k/v/out device
+# pointers plus head/dim/seq/scale/window geometry — so bundling them into
+# a struct would only add marshalling boilerplate on a hot launch path.
+too-many-arguments-threshold = 16

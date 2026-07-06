@@ -1,0 +1,73 @@
+# =============================================================================
+# registry.toml — the certified model set. Single source of truth:
+# docs/models.md and the CLI listing are generated from this file, and
+# .github/workflows/models-nightly.yml re-preflights every row.
+#
+# Certification levels:
+#   verified            full `cima vet` battery passed on real hardware
+#   verified-by-family  metadata preflight passed AND a smaller family
+#                       member holds a `verified` row
+#   avoid               known-defective artifact, listed to warn
+#
+# A row requires: the vet or preflight report attached to the admitting PR.
+# =============================================================================
+
+[[model]]
+repo = "Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0"
+family = "qwen2"
+format = "gguf"
+caps = ["generate"]
+min_vram_gib = 2
+status = "verified"
+vet_date = "2026-07-04"
+notes = "gguf-kernel control model; temp-0 A/B against reference output"
+
+[[model]]
+repo = "Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_k_m"
+family = "qwen2"
+format = "gguf"
+caps = ["generate"]
+min_vram_gib = 2
+status = "verified"
+vet_date = "2026-07-04"
+notes = "exercises the 32-grain fallback formats (Q5_0/Q5_1) inside a K-quant file"
+
+[[model]]
+repo = "Qwen/Qwen2.5-0.5B-Instruct"
+family = "qwen2"
+format = "safetensors"
+caps = ["generate"]
+min_vram_gib = 2
+status = "verified"
+vet_date = "2026-07-04"
+notes = "safetensors bf16 reference for the format A/B benchmark"
+
+[[model]]
+repo = "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit"
+family = "qwen2"
+format = "safetensors+bnb"
+caps = ["generate"]
+min_vram_gib = 2
+status = "verified"
+vet_date = "2026-07-04"
+notes = "bitsandbytes NF4; executes via host dequant to f16 on the standard pipeline"
+
+[[model]]
+repo = "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M"
+family = "gemma4"
+format = "gguf"
+caps = ["generate", "vision", "audio"]
+min_vram_gib = 6
+status = "verified"
+vet_date = "2026-07-04"
+notes = "any-to-any pipeline reference; mmproj sidecar pulled automatically"
+
+[[model]]
+repo = "bartowski/Qwen2.5-7B-Instruct-GGUF:IQ4_XS"
+family = "qwen2"
+format = "gguf"
+caps = ["generate"]
+min_vram_gib = 6
+status = "verified-by-family"
+vet_date = "2026-07-04"
+notes = "admitted on qwen2 family verification + clean preflight; loads on a 6 GiB card"

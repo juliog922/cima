@@ -1,0 +1,5 @@
+# The toolchain CI builds and releases with. Local builds on newer stable
+# generally work; version disputes are settled by this file.
+[toolchain]
+channel = "1.83"
+components = ["rustfmt", "clippy"]

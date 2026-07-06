@@ -1,0 +1,165 @@
+# =============================================================================
+# ci — the single gate for correctness and publishing.
+#
+#   * Pull requests: run every check (lint, unit tests, kernel compile, image
+#     build, shell lint) and, on the self-hosted GPU box, the full on-hardware
+#     battery — `cima selftest` + `scripts/test.sh`. NOTHING publishes.
+#   * Push to main (i.e. a merged, approved PR): run the SAME checks again,
+#     and ONLY if they all pass, publish the Docker image to the registry.
+#
+# The publish job `needs:` every test job, so a red test blocks the image.
+# Push-to-main should itself be gated by branch protection (see docs) so the
+# only way onto main is a PR whose `ci` checks are green.
+# =============================================================================
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Registry + image name. GHCR by default; override REGISTRY/IMAGE in repo
+  # variables (Settings -> Secrets and variables -> Actions -> Variables) to
+  # push elsewhere (e.g. a private registry).
+  REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+  IMAGE: ${{ vars.IMAGE || github.repository }}
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.83"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests (CPU)
+        run: cargo test --locked
+      - name: Examples compile
+        run: cargo build --examples --locked
+
+  kernels:
+    # NVRTC syntax/arch check of kernels.cu without a GPU: the toolkit image
+    # carries nvcc, which validates everything NVRTC will compile at runtime,
+    # for every compute capability the engine targets.
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile kernels for target archs
+        run: |
+          for arch in 75 80 86 89 90; do
+            echo "== sm_$arch"
+            nvcc -arch=sm_$arch -ptx src/kernels.cu -o /tmp/k_$arch.ptx
+          done
+
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning scripts/*.sh
+      - name: comment lint
+        run: scripts/comment-lint.sh
+
+  image-build:
+    # Build the image on every PR and push WITHOUT pushing it. This proves the
+    # Dockerfile is green independently of the publish step, so a broken build
+    # fails fast on PRs (where publish never runs).
+    runs-on: ubuntu-24.04
+    needs: [lint-and-test, kernels]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: cima:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  gpu:
+    # The real correctness gate: on-hardware selftest + API/behaviour suite.
+    # Runs on PRs AND on push to main so a merge is re-verified on hardware.
+    # Skipped on forked PRs (no access to the self-hosted runner / secrets).
+    if: github.event.pull_request.head.repo.fork == false || github.event_name == 'push'
+    runs-on: [self-hosted, gpu]
+    needs: [lint-and-test, kernels]
+    env:
+      COMPOSE_FILE: docker/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v4
+      - name: Numerical selftest (GPU vs CPU, every kernel)
+        run: |
+          docker compose up -d --build cima
+          docker compose exec -T cima cima selftest
+      - name: API conformance + behaviour + adversarial stress
+        run: ./scripts/test.sh
+      - name: Benchmark smoke + regression tripwire
+        run: |
+          GEN_RUNS=5 LOAD_RUNS=2 MEDIA_RUNS=2 ./scripts/benchs.sh
+          ./scripts/bench-compare.sh bench-results.csv scripts/bench-baseline.csv
+      - name: Archive results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.csv
+      - name: Teardown
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+  publish:
+    # Publish ONLY on a merged/approved push to main, and ONLY after every
+    # test job above is green (needs: gates it). Tags the image with the
+    # Cargo.toml version, the short commit SHA, and `latest`.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    needs: [lint-and-test, kernels, shell, image-build, gpu]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $v"
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # version from Cargo.toml, the commit SHA for traceability, and the
+          # rolling `latest`. Pushing the same version twice overwrites that
+          # tag — bump Cargo.toml for a distinct release, or cut a git tag for
+          # immutable semver artifacts (see release.yml).
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=sha,format=short
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

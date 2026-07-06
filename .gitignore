@@ -1,0 +1,24 @@
+# Build output
+/target/
+ 
+# Local weight store and runtime artifacts — never in git history
+/models/
+*/logs/
+bench-results.csv
+ 
+# Generated test/bench media assets (CI regenerates via ffmpeg/espeak)
+*.wav
+*.mp3
+*.jpg
+*.png
+!docs/**/*.png
+ 
+# Local secrets/config — keep the tracked template, ignore the real one
+.env
+ 
+# Self-hosted GitHub Actions runner (installed into the repo dir) — never commit
+/actions-runner/
+/_work/
+runner-*.tar.gz
+
+.vscode
