@@ -2486,6 +2486,15 @@ fn compile_ptx(src: &str, maj: i32, min: i32) -> Res<CString> {
         {
             return Err(err!("cuda", "nvrtcCreateProgram failed"));
         }
+        // Companility filter
+        let (target_maj, target_min) = if maj >= 10 {
+            // Hopper (sm_90) o Ada (sm_89) fallback.
+            (9, 0) 
+        } else {
+            (maj, min)
+        };
+    
+        let arch = CString::new(format!("--gpu-architecture=compute_{}{}", target_maj, target_min)).unwrap();
         let arch = CString::new(format!("--gpu-architecture=compute_{}{}", maj, min)).unwrap();
         let fast = CString::new("--use_fast_math").unwrap();
         // NVRTC has no default header search path — hand it the toolkit's
