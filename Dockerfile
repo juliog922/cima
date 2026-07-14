@@ -15,7 +15,7 @@
 #   docker run --gpus all -p 11435:11435 -v cima-models:/data/models cima
 # =============================================================================
 
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS build
+FROM nvidia/cuda:13.1.0-devel-ubuntu22.04 AS build
 ARG RUST_VERSION=1.83.0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -33,7 +33,7 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 RUN cargo build --release --locked
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:13.1.0-runtime-ubuntu22.04
 LABEL org.opencontainers.image.title="cima" \
       org.opencontainers.image.description="Minimalist CUDA inference engine with an Ollama-compatible API" \
       org.opencontainers.image.source="https://github.com/OWNER/cima" \
@@ -52,7 +52,7 @@ COPY --from=build /build/target/release/cima /usr/local/bin/cima
 # but not the headers, so copy just the include tree from the devel stage
 # (~tens of MB) rather than pulling the full devel image (~GBs). Copy into
 # the versioned prefix that the /usr/local/cuda symlink resolves to.
-COPY --from=build /usr/local/cuda/include /usr/local/cuda-12.4/include
+COPY --from=build /usr/local/cuda/include /usr/local/cuda-13.1/include
 COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
@@ -64,7 +64,7 @@ WORKDIR /app
 ENV CIMA_HOST=0.0.0.0 \
     CIMA_PORT=11435 \
     CIMA_MODELS_DIR=/data/models \
-    CUDA_HOME=/usr/local/cuda-12.4
+    CUDA_HOME=/usr/local/cuda-13.1
 VOLUME /data/models
 EXPOSE 11435
 # /api/ready returns 503 until the server is live AND every model listed in
