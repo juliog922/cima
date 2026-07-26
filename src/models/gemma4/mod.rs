@@ -1390,7 +1390,7 @@ impl Gemma4 {
 
             let blk = if blkid { self.ws.blkid.ptr } else { 0 };
             if rows == 1 {
-                if d % 32 == 0 && d <= 256 {
+                if d % 32 == 0 && d <= 512 {
                     let csz = crate::cuda::ATT_CSZ;
                     let nc = t.max_seq.div_ceil(csz);
                     ctx.attn_decode_split(
@@ -2744,7 +2744,7 @@ impl crate::traits::Architecture for Gemma4 {
             // models, so this is no longer unconditionally true.
             seq_parallel_attention: self.cfg.text.head_dim % 32 == 0
                 && self.cfg.text.global_head_dim % 32 == 0
-                && self.cfg.text.global_head_dim <= 256,
+                && self.cfg.text.global_head_dim <= 512,
             device_pipeline: false, // PLE gathers a host table by token id
         }
     }

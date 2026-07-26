@@ -115,14 +115,21 @@ pub mod protocol {
     ) -> Json {
         stream_chunk(model, chat, full_text.unwrap_or(""), true)
             .set("done_reason", Json::s(done_reason))
-            .set("total_duration", Json::n(total_ms * 1e6))
-            .set("load_duration", Json::n(load_ms * 1e6))
-            .set("prompt_eval_count", Json::n(prompt_tokens as f64))
-            .set("prompt_eval_duration", Json::n(ttft_ms * 1e6))
-            .set("eval_count", Json::n(gen_tokens as f64))
+            // Ollama specifies these as integer nanoseconds. ms * 1e6
+            // leaves float residue (670802022.0000001), which the
+            // serializer then prints with a fraction and typed clients
+            // reject when deserializing into u64. Round at the source.
+            .set("total_duration", Json::u((total_ms * 1e6).round() as u64))
+            .set("load_duration", Json::u((load_ms * 1e6).round() as u64))
+            .set("prompt_eval_count", Json::u(prompt_tokens as u64))
+            .set(
+                "prompt_eval_duration",
+                Json::u((ttft_ms * 1e6).round() as u64),
+            )
+            .set("eval_count", Json::u(gen_tokens as u64))
             .set(
                 "eval_duration",
-                Json::n((total_ms - ttft_ms).max(0.0) * 1e6),
+                Json::u(((total_ms - ttft_ms).max(0.0) * 1e6).round() as u64),
             )
     }
 

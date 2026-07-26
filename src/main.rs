@@ -25,7 +25,7 @@ Usage:
   cima embed <MODEL> <TEXT>       Pooled embedding vector (--out FILE for raw f32)
   cima available                  Curated registry of vetted, pull-ready models
   cima profile <MODEL>            Decode-step anatomy vs the bandwidth floor
-  cima selftest [gguf|lm]         GPU numerical self-tests (no downloads)
+  cima selftest [gguf|lm|attn|prefill|gemm]  GPU numerical self-tests
   cima audio-map <GGUF> <ST>      Recover gguf audio-tensor names by cosine
                                      match against the original safetensors
   cima vet <ORG/REPO> [--caps L]  Pull (if needed) + certification battery;
@@ -162,6 +162,16 @@ fn dispatch(args: &[String]) -> Res<()> {
         "selftest" => {
             let which = args.get(1).map(String::as_str);
             let ctx = Arc::new(CudaCtx::init(gpu_index())?);
+            if which.is_none() || which == Some("attn") {
+                // Decode attention (monolithic + split) vs an f64 host
+                // reference across every geometry dispatch can select.
+                selftest::run_attention(ctx.clone())?;
+            }
+            if which.is_none() || which == Some("prefill") {
+                // Tiled prefill vs the reference kernel vs an f64 host
+                // model, across every mask regime dispatch can select.
+                selftest::run_prefill(ctx.clone())?;
+            }
             if which.is_none() || which == Some("gemm") {
                 // Native f16 GEMM (the cuBLAS-independence path) vs the
                 // f64 host reference — gate for the slim container image.

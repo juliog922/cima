@@ -1246,10 +1246,15 @@ fn caps_of(dir: &std::path::Path, has_gguf: bool) -> &'static str {
         // final hidden state (embed_tokens -> forward -> rmsnorm -> meanpool),
         // which is format-agnostic — the same forward pass generation uses.
         // The quant weights feed it exactly as they feed decode.
-        return if has_mmproj {
-            "text+vision+audio+embed"
-        } else {
-            "text+embed"
+        //
+        // An mmproj sidecar does NOT imply audio: unsloth's gemma-4-31B
+        // export carries 355 vision tensors and no audio tower, while the
+        // config declares audio_config. Claiming audio here contradicted
+        // /api/ps and made clients send clips the model cannot accept.
+        return match (has_mmproj, mmproj_has_audio(dir)) {
+            (true, true) => "text+vision+audio+embed",
+            (true, false) => "text+vision+embed",
+            _ => "text+embed",
         };
     }
     let mm = std::fs::read_to_string(dir.join("config.json"))
@@ -1263,6 +1268,39 @@ fn caps_of(dir: &std::path::Path, has_gguf: bool) -> &'static str {
     } else {
         "text"
     }
+}
+
+/// Does an mmproj sidecar in `dir` carry an audio tower?
+///
+/// llama.cpp mmproj exports name vision tensors `v.*` and audio ones
+/// `a.*` / `audio_tower.*`. Rather than parse the GGUF header, scan the
+/// tensor-name region of the first mmproj file for an audio prefix: the
+/// names live in the header, so a bounded read from the front settles it.
+fn mmproj_has_audio(dir: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+        if !(n.ends_with(".gguf") && n.contains("mmproj")) {
+            continue;
+        }
+        let Ok(mut f) = std::fs::File::open(e.path()) else {
+            continue;
+        };
+        // 8 MiB covers the metadata + tensor table of any mmproj.
+        let mut buf = vec![0u8; 8 << 20];
+        let read = f.read(&mut buf).unwrap_or(0);
+        buf.truncate(read);
+        let hay = buf.as_slice();
+        for pat in [b"audio_tower".as_slice(), b"a.blk.".as_slice()] {
+            if hay.windows(pat.len()).any(|w| w == pat) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `list_local` plus a capability string per row.
