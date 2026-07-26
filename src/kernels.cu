@@ -552,7 +552,10 @@ extern "C" __global__ void k_attn_decode_split(const __half* q, const __half* kc
   // owns dim/32 components of the accumulator; the q·k dot reduces with a
   // shuffle butterfly so every lane sees the score). No __syncthreads in
   // the position loop — the only block sync is the final 4-way merge.
-  // Requires dim % 32 == 0 and dim <= 128 (head_dim 64/128 in practice).
+  // Requires dim % 32 == 0 and dim <= 512. The 512 ceiling covers gemma4's
+  // global_head_dim: without it those layers fall back to k_attn_decode,
+  // which is one block per head walking every key with ~4 __syncthreads
+  // apiece — measured at 8.7 tok/s on a 3164-token context.
   const int R = dim >> 5;                   // accumulator regs per lane
   if(pos_dev) seq = *pos_dev + 1;
   int h = blockIdx.x / n_chunks, ci = blockIdx.x % n_chunks;
@@ -564,23 +567,23 @@ extern "C" __global__ void k_attn_decode_split(const __half* q, const __half* kc
   const __half* qh = q + (size_t)h*dim;
   const __half* kh = kc + (size_t)kvh*max_seq*dim;
   const __half* vh = vc + (size_t)kvh*max_seq*dim;
-  float qreg[8];
+  float qreg[16];
   #pragma unroll
-  for(int r=0;r<8;r++) qreg[r] = (r<R) ? __half2float(qh[r*32+lane]) : 0.f;
-  float acc[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+  for(int r=0;r<16;r++) qreg[r] = (r<R) ? __half2float(qh[r*32+lane]) : 0.f;
+  float acc[16] = {0.f};
   float m = -1e30f, l = 0.f;
   for(int s=s0+wid;s<s1;s+=nw){
     const __half* ks = kh + (size_t)s*dim;
     float d = 0.f;
     #pragma unroll
-    for(int r=0;r<8;r++) if(r<R) d += qreg[r]*__half2float(ks[r*32+lane]);
+    for(int r=0;r<16;r++) if(r<R) d += qreg[r]*__half2float(ks[r*32+lane]);
     #pragma unroll
     for(int o=16;o>0;o>>=1) d += __shfl_xor_sync(0xffffffffu, d, o);
     float score = d*scale;
     float m2 = fmaxf(m, score), corr = expf(m-m2), p = expf(score-m2);
     const __half* vs = vh + (size_t)s*dim;
     #pragma unroll
-    for(int r=0;r<8;r++) if(r<R) acc[r] = acc[r]*corr + p*__half2float(vs[r*32+lane]);
+    for(int r=0;r<16;r++) if(r<R) acc[r] = acc[r]*corr + p*__half2float(vs[r*32+lane]);
     l = l*corr + p; m = m2;
   }
   // Merge the warps' partials (log-sum-exp) through shared memory.
@@ -588,23 +591,23 @@ extern "C" __global__ void k_attn_decode_split(const __half* q, const __half* kc
   float* mine = sh + wid*(dim+2);
   if(lane==0){ mine[0]=m; mine[1]=l; }
   #pragma unroll
-  for(int r=0;r<8;r++) if(r<R) mine[2+r*32+lane]=acc[r];
+  for(int r=0;r<16;r++) if(r<R) mine[2+r*32+lane]=acc[r];
   __syncthreads();
   if(wid != 0) return;
   float M = -1e30f;
   for(int w=0;w<nw;w++) M = fmaxf(M, sh[w*(dim+2)]);
-  float L = 0.f, out[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+  float L = 0.f, out[16] = {0.f};
   for(int w=0;w<nw;w++){
     float* pw = sh + w*(dim+2);
     float wgt = expf(pw[0]-M);
     L += wgt*pw[1];
     #pragma unroll
-    for(int r=0;r<8;r++) if(r<R) out[r] += wgt*pw[2+r*32+lane];
+    for(int r=0;r<16;r++) if(r<R) out[r] += wgt*pw[2+r*32+lane];
   }
   float* ph = part + ((size_t)h*n_chunks + ci)*(dim+2);
   if(lane==0){ ph[0]=M; ph[1]=L; }
   #pragma unroll
-  for(int r=0;r<8;r++) if(r<R) ph[2+r*32+lane]=out[r];
+  for(int r=0;r<16;r++) if(r<R) ph[2+r*32+lane]=out[r];
 }
 
 // Combine the per-chunk partials of one head: M = max m_i, then
@@ -633,6 +636,120 @@ extern "C" __global__ void k_attn_reduce(const float* part, __half* out,
   }
   __half* oh = out + (size_t)h*dim;
   for(int i=t;i<dim;i+=blockDim.x) oh[i]=__float2half(accr[i]/L);
+}
+
+// ---- tiled prefill attention (flash-style) --------------------------------
+// One warp per query row with WARPS queries resident per block, and `bk` keys
+// staged in shared memory per tile and reused across every resident query.
+//
+// k_attn_prefill gives one (row, head) pair to a whole block and walks the key
+// sequence one key at a time, doing a block-wide tree reduction and ~10
+// __syncthreads() per key, with no K/V reuse across queries. Measured on a
+// 31B/L40S at 3172 tokens it accounts for ~6.9 s of an 8.6 s prefill.
+//
+// Here: the dot product is a warp shuffle reduction (5 shuffles, no barrier),
+// each K/V tile is loaded once and consumed by all resident queries, and the
+// accumulator lives in registers. Barriers drop from ~10 per key to 2 per
+// tile. The online softmax, the running (m, l, acc) triple, and the
+// causal/window/media-block mask semantics are unchanged.
+//
+// Shared memory: 2 * bk * dim * sizeof(__half), supplied dynamically.
+// Grid: (ceil(nrows / WARPS), q_heads). Requires dim % 32 == 0 && dim <= 512;
+// the launcher falls back to k_attn_prefill otherwise.
+extern "C" __global__ void k_attn_prefill_tiled(
+        const __half* q, const __half* kc, const __half* vc,
+        __half* out, int q_heads, int kv_heads, int dim, int pos0,
+        int max_seq, int nrows, int causal, float scale, int window,
+        const int* blkid, int bk){
+  // Distinct name required: every other kernel here declares
+  // `extern __shared__ float sh[]`, and NVRTC rejects the same extern
+  // __shared__ identifier with a different element type.
+  extern __shared__ __half shp[];
+  __half* Ks = shp;
+  __half* Vs = shp + (size_t)bk * dim;
+
+  const int warps = blockDim.x >> 5;
+  const int lane  = threadIdx.x & 31;
+  const int warp  = threadIdx.x >> 5;
+  const int row   = blockIdx.x * warps + warp;
+  const int h     = blockIdx.y;
+  const int kvh   = h / (q_heads / kv_heads);
+  const int dpl   = dim >> 5;                 // elements per lane, <= 16
+
+  const __half* kh = kc + (size_t)kvh * max_seq * dim;
+  const __half* vh = vc + (size_t)kvh * max_seq * dim;
+
+  // Inactive warps still participate in the cooperative tile loads and in
+  // every __syncthreads(), so the barriers below stay block-uniform.
+  const int active = (row < nrows);
+  const int qpos   = pos0 + row;
+  const int myblk  = (active && blkid) ? blkid[qpos] : -1;
+
+  float qreg[16], acc[16];
+  float m = -1e30f, l = 0.f;
+  int seq_q = 0;
+  if(active){
+    const __half* qh = q + ((size_t)row * q_heads + h) * dim;
+    #pragma unroll
+    for(int i = 0; i < 16; i++){
+      if(i < dpl){ qreg[i] = __half2float(qh[lane + (i << 5)]); acc[i] = 0.f; }
+    }
+    seq_q = (!causal || myblk >= 0) ? (pos0 + nrows) : (qpos + 1);
+  }
+
+  // Block-uniform upper bound: the largest seq_q any resident warp can want.
+  // With a media-block map present any query may look forward, so the whole
+  // processed prefix is in play.
+  int last = blockIdx.x * warps + warps; if(last > nrows) last = nrows;
+  const int seq_blk = (!causal || blkid) ? (pos0 + nrows) : (pos0 + last);
+
+  for(int s0 = 0; s0 < seq_blk; s0 += bk){
+    int cnt = seq_blk - s0; if(cnt > bk) cnt = bk;
+    __syncthreads();
+    for(int idx = threadIdx.x; idx < cnt * dim; idx += blockDim.x){
+      Ks[idx] = kh[(size_t)s0 * dim + idx];
+      Vs[idx] = vh[(size_t)s0 * dim + idx];
+    }
+    __syncthreads();
+    if(!active) continue;
+
+    for(int j = 0; j < cnt; j++){
+      const int s = s0 + j;
+      if(s >= seq_q) break;                  // warp-uniform
+      if(causal){
+        const int same_block = (myblk >= 0) && blkid && (blkid[s] == myblk);
+        if(s > qpos){
+          if(!same_block) continue;          // forward: same block only
+        } else {
+          const int in_window = (window <= 0) || (qpos - s < window);
+          if(!in_window && !same_block) continue;
+        }
+      }
+      const __half* kj = Ks + (size_t)j * dim;
+      float d = 0.f;
+      #pragma unroll
+      for(int i = 0; i < 16; i++)
+        if(i < dpl) d += qreg[i] * __half2float(kj[lane + (i << 5)]);
+      #pragma unroll
+      for(int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+      d *= scale;
+
+      const float m2 = fmaxf(m, d);
+      const float corr = __expf(m - m2), p = __expf(d - m2);
+      const __half* vj = Vs + (size_t)j * dim;
+      #pragma unroll
+      for(int i = 0; i < 16; i++)
+        if(i < dpl) acc[i] = acc[i] * corr + p * __half2float(vj[lane + (i << 5)]);
+      l = l * corr + p; m = m2;
+    }
+  }
+
+  if(!active) return;
+  __half* oh = out + ((size_t)row * q_heads + h) * dim;
+  const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+  #pragma unroll
+  for(int i = 0; i < 16; i++)
+    if(i < dpl) oh[lane + (i << 5)] = __float2half(acc[i] * inv);
 }
 
 // ---- prefill attention: one block per (token, head) ----

@@ -375,6 +375,405 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// vs an f64 CPU reference, on prefill-shaped problems including the
 /// column-range (ldc > n) variant with sentinel checks outside the range.
 /// When cuBLAS is dlopened the dispatcher path is validated too.
+/// `cima selftest attn` — the decode attention kernels against an f64 CPU
+/// reference, and the split path against the monolithic one.
+///
+/// This suite exists because it did not. `selftest` covered GEMM, GGUF
+/// dequant, GEMV and gather, and had zero coverage of attention — so the
+/// dim<=512 widening of `k_attn_decode_split` had to be validated by
+/// hand-diffing two generations. Every regime that dispatch can select is
+/// swept here: head dims 64/128/256/512 (gemma4 runs 256 sliding and 512
+/// global), GQA 1:1 and 8:1, windowed and full, and sequence lengths that
+/// straddle the ATT_CSZ chunk boundary.
+pub fn run_attention(ctx: Arc<CudaCtx>) -> Res<()> {
+    println!(
+        "== decode attention: monolithic vs split vs f64 host reference, {} ==",
+        ctx.device_name
+    );
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let mut rnd = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // centred in [-1, 1) so scores span both signs
+        ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    };
+
+    let mut worst_split = 0.0f64;
+    let mut worst_mono = 0.0f64;
+    let mut cases = 0usize;
+
+    // (dim, q_heads, kv_heads, window)
+    for &(dim, qh, kvh, window) in &[
+        (64usize, 8usize, 8usize, 0usize),
+        (128, 8, 8, 0),
+        (128, 32, 4, 0),
+        (256, 8, 1, 0),     // gemma4 E2B sliding geometry
+        (256, 32, 16, 512), // gemma4 31B sliding, windowed
+        (512, 32, 4, 0),    // gemma4 31B global — the widened path
+        (512, 8, 8, 256),
+    ] {
+        for &seq in &[1usize, 127, 128, 129, 300, 1000] {
+            if window > 0 && seq <= 1 {
+                continue;
+            }
+            let max_seq = 1024.max(seq);
+            let scale = 1.0f32 / (dim as f32).sqrt();
+
+            // Host-side inputs. K/V are laid out per kv head: [kvh][max_seq][dim].
+            let mut q16 = vec![0u16; qh * dim];
+            let mut k16 = vec![0u16; kvh * max_seq * dim];
+            let mut v16 = vec![0u16; kvh * max_seq * dim];
+            for x in q16.iter_mut() {
+                *x = crate::num::f32_to_f16(rnd() as f32);
+            }
+            for x in k16.iter_mut().chain(v16.iter_mut()) {
+                *x = crate::num::f32_to_f16(rnd() as f32);
+            }
+
+            let (dq, dk, dv) = (
+                ctx.alloc(q16.len() * 2)?,
+                ctx.alloc(k16.len() * 2)?,
+                ctx.alloc(v16.len() * 2)?,
+            );
+            for (buf, host) in [(&dq, &q16), (&dk, &k16), (&dv, &v16)] {
+                ctx.htod(buf, unsafe {
+                    std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
+                })?;
+            }
+            let d_mono = ctx.alloc(qh * dim * 2)?;
+            let d_split_out = ctx.alloc(qh * dim * 2)?;
+            let csz = crate::cuda::ATT_CSZ;
+            let n_chunks = max_seq.div_ceil(csz);
+            let d_part = ctx.alloc(qh * n_chunks * (dim + 2) * 4)?;
+
+            ctx.attn_decode(
+                dq.ptr, dk.ptr, dv.ptr, d_mono.ptr, qh, kvh, dim, seq, max_seq, scale, window, 0,
+            )?;
+            ctx.attn_decode_split(
+                dq.ptr, dk.ptr, dv.ptr, d_part.ptr, qh, kvh, dim, seq, max_seq, csz, n_chunks,
+                scale, window, 0,
+            )?;
+            ctx.attn_reduce(
+                d_part.ptr,
+                d_split_out.ptr,
+                qh,
+                dim,
+                csz,
+                n_chunks,
+                seq,
+                window,
+                0,
+            )?;
+            ctx.sync()?;
+
+            let mut mono = vec![0u16; qh * dim];
+            let mut split = vec![0u16; qh * dim];
+            ctx.dtoh(
+                unsafe {
+                    std::slice::from_raw_parts_mut(mono.as_mut_ptr() as *mut u8, mono.len() * 2)
+                },
+                &d_mono,
+            )?;
+            ctx.dtoh(
+                unsafe {
+                    std::slice::from_raw_parts_mut(split.as_mut_ptr() as *mut u8, split.len() * 2)
+                },
+                &d_split_out,
+            )?;
+
+            // f64 reference: plain softmax over the visible window, no online
+            // rescaling, so it is independent of the kernels' formulation.
+            let lo = if window > 0 && seq > window {
+                seq - window
+            } else {
+                0
+            };
+            for h in 0..qh {
+                let kvi = h / (qh / kvh);
+                let qv: Vec<f64> = (0..dim)
+                    .map(|i| crate::num::f16_to_f32(q16[h * dim + i]) as f64)
+                    .collect();
+                let mut scores = Vec::with_capacity(seq - lo);
+                for s in lo..seq {
+                    let base = (kvi * max_seq + s) * dim;
+                    let mut dot = 0.0f64;
+                    for i in 0..dim {
+                        dot += qv[i] * crate::num::f16_to_f32(k16[base + i]) as f64;
+                    }
+                    scores.push(dot * scale as f64);
+                }
+                let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let denom: f64 = exps.iter().sum();
+                for i in 0..dim {
+                    let mut acc = 0.0f64;
+                    for (j, s) in (lo..seq).enumerate() {
+                        let base = (kvi * max_seq + s) * dim;
+                        acc += exps[j] * crate::num::f16_to_f32(v16[base + i]) as f64;
+                    }
+                    let want = acc / denom;
+                    // f16 output: one ulp near 1.0 is ~1e-3, so compare in
+                    // ulp-like units rather than absolute error.
+                    let ulp = (want.abs().max(1.0)) * 1e-3;
+                    let em =
+                        ((crate::num::f16_to_f32(mono[h * dim + i]) as f64 - want) / ulp).abs();
+                    let es =
+                        ((crate::num::f16_to_f32(split[h * dim + i]) as f64 - want) / ulp).abs();
+                    worst_mono = worst_mono.max(em);
+                    worst_split = worst_split.max(es);
+                    if !em.is_finite() || !es.is_finite() || em > 8.0 || es > 8.0 {
+                        return Err(err!(
+                            "selftest",
+                            "attention mismatch dim={} qh={} kvh={} window={} seq={} head={} \
+                             elem={}: want {:.6}, mono {:.6} ({:.1} u), split {:.6} ({:.1} u)",
+                            dim,
+                            qh,
+                            kvh,
+                            window,
+                            seq,
+                            h,
+                            i,
+                            want,
+                            crate::num::f16_to_f32(mono[h * dim + i]),
+                            em,
+                            crate::num::f16_to_f32(split[h * dim + i]),
+                            es
+                        ));
+                    }
+                }
+            }
+            cases += 1;
+        }
+        println!(
+            "SELFTEST attn dim={:<4} heads={}/{:<3} window={:<5} \
+             worst mono {:.1} u / split {:.1} u (tol 8)",
+            dim, qh, kvh, window, worst_mono, worst_split
+        );
+    }
+    println!(
+        "== attention within tolerance ({} cases: dim 64/128/256/512, GQA 1:1..8:1, \
+         windowed + full, seq across chunk boundaries) ==",
+        cases
+    );
+    Ok(())
+}
+
+/// `cima selftest prefill` — the tiled prefill kernel against the reference
+/// one, and the reference against an f64 CPU model.
+///
+/// The reference `k_attn_prefill` is the oracle: it has served every prefill
+/// in production, so the tiled rewrite must reproduce it. Anchoring the
+/// reference to a CPU model as well means a disagreement is attributable —
+/// reference-vs-CPU isolates a bug in the oracle, tiled-vs-reference isolates
+/// one in the rewrite. Every mask regime the dispatcher can select is swept:
+/// causal, sliding window, media-block bidirectional spans, their overlap,
+/// fully bidirectional (tower path), and a chunked continuation with pos0 > 0.
+pub fn run_prefill(ctx: Arc<CudaCtx>) -> Res<()> {
+    println!(
+        "== prefill attention: tiled vs reference vs f64 host, {} ==",
+        ctx.device_name
+    );
+    let mut state = 0xD1B54A32D192ED03u64;
+    let mut rnd = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    };
+
+    let mut cases = 0usize;
+    let mut worst_ref = 0.0f64;
+    let mut worst_tiled = 0.0f64;
+
+    // (label, causal, window, blocks, pos0)
+    for &(label, causal, window, blocks, pos0) in &[
+        ("causal", true, 0usize, false, 0usize),
+        ("window", true, 64, false, 0),
+        ("blocks", true, 0, true, 0),
+        ("window+blocks", true, 64, true, 0),
+        ("bidirectional", false, 0, false, 0),
+        ("continuation", true, 0, false, 96),
+    ] {
+        for &dim in &[128usize, 256, 512] {
+            // rows chosen to exercise partial warps and tile-boundary tails
+            for &rows in &[1usize, 7, 13, 64, 130] {
+                let (qh, kvh) = if dim == 512 { (8usize, 2usize) } else { (8, 8) };
+                let max_seq = 512;
+                if pos0 + rows > max_seq {
+                    continue;
+                }
+                let scale = 1.0f32 / (dim as f32).sqrt();
+                let seq_end = pos0 + rows;
+
+                let mut q16 = vec![0u16; rows * qh * dim];
+                let mut k16 = vec![0u16; kvh * max_seq * dim];
+                let mut v16 = vec![0u16; kvh * max_seq * dim];
+                for x in q16.iter_mut().chain(k16.iter_mut()).chain(v16.iter_mut()) {
+                    *x = crate::num::f32_to_f16(rnd() as f32);
+                }
+                // Media blocks: three spans of 8 positions, -1 elsewhere.
+                let mut blk = vec![-1i32; max_seq];
+                if blocks {
+                    for (bi, start) in [4usize, 20, 40].iter().enumerate() {
+                        for slot in blk.iter_mut().take((*start + 8).min(max_seq)).skip(*start) {
+                            *slot = bi as i32;
+                        }
+                    }
+                }
+
+                let dq = ctx.alloc(q16.len() * 2)?;
+                let dk = ctx.alloc(k16.len() * 2)?;
+                let dv = ctx.alloc(v16.len() * 2)?;
+                let d_ref = ctx.alloc(rows * qh * dim * 2)?;
+                let d_til = ctx.alloc(rows * qh * dim * 2)?;
+                for (buf, host) in [(&dq, &q16), (&dk, &k16), (&dv, &v16)] {
+                    ctx.htod(buf, unsafe {
+                        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
+                    })?;
+                }
+                let d_blk = if blocks {
+                    let b = ctx.alloc(max_seq * 4)?;
+                    ctx.htod(&b, unsafe {
+                        std::slice::from_raw_parts(blk.as_ptr() as *const u8, max_seq * 4)
+                    })?;
+                    Some(b)
+                } else {
+                    None
+                };
+                let blk_ptr = d_blk.as_ref().map(|b| b.ptr).unwrap_or(0);
+
+                ctx.attn_prefill_ref(
+                    dq.ptr, dk.ptr, dv.ptr, d_ref.ptr, rows, qh, kvh, dim, pos0, max_seq, causal,
+                    scale, window, blk_ptr,
+                )?;
+                ctx.attn_prefill_tiled(
+                    dq.ptr, dk.ptr, dv.ptr, d_til.ptr, rows, qh, kvh, dim, pos0, max_seq, causal,
+                    scale, window, blk_ptr,
+                )?;
+                ctx.sync()?;
+
+                let mut oref = vec![0u16; rows * qh * dim];
+                let mut otil = vec![0u16; rows * qh * dim];
+                ctx.dtoh(
+                    unsafe {
+                        std::slice::from_raw_parts_mut(oref.as_mut_ptr() as *mut u8, oref.len() * 2)
+                    },
+                    &d_ref,
+                )?;
+                ctx.dtoh(
+                    unsafe {
+                        std::slice::from_raw_parts_mut(otil.as_mut_ptr() as *mut u8, otil.len() * 2)
+                    },
+                    &d_til,
+                )?;
+
+                for r in 0..rows {
+                    let qpos = pos0 + r;
+                    let myblk = if blocks { blk[qpos] } else { -1 };
+                    let seq_q = if !causal || myblk >= 0 {
+                        seq_end
+                    } else {
+                        qpos + 1
+                    };
+                    for h in 0..qh {
+                        let kvi = h / (qh / kvh);
+                        let qv: Vec<f64> = (0..dim)
+                            .map(|i| crate::num::f16_to_f32(q16[(r * qh + h) * dim + i]) as f64)
+                            .collect();
+                        // Visible keys under the same mask the kernels apply.
+                        let mut vis = Vec::new();
+                        // `s` is a sequence POSITION compared against qpos and
+                        // the window, not merely an index into blk; an
+                        // enumerate() rewrite would obscure that.
+                        #[allow(clippy::needless_range_loop)]
+                        for s in 0..seq_q {
+                            if causal {
+                                let same = myblk >= 0 && blocks && blk[s] == myblk;
+                                if s > qpos {
+                                    if !same {
+                                        continue;
+                                    }
+                                } else {
+                                    let inw = window == 0 || (qpos - s) < window;
+                                    if !inw && !same {
+                                        continue;
+                                    }
+                                }
+                            }
+                            vis.push(s);
+                        }
+                        if vis.is_empty() {
+                            continue;
+                        }
+                        let scores: Vec<f64> = vis
+                            .iter()
+                            .map(|&s| {
+                                let base = (kvi * max_seq + s) * dim;
+                                let mut d = 0.0f64;
+                                for i in 0..dim {
+                                    d += qv[i] * crate::num::f16_to_f32(k16[base + i]) as f64;
+                                }
+                                d * scale as f64
+                            })
+                            .collect();
+                        let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let ex: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                        let den: f64 = ex.iter().sum();
+                        for i in 0..dim {
+                            let mut acc = 0.0f64;
+                            for (j, &s) in vis.iter().enumerate() {
+                                acc += ex[j]
+                                    * crate::num::f16_to_f32(v16[(kvi * max_seq + s) * dim + i])
+                                        as f64;
+                            }
+                            let want = acc / den;
+                            let ulp = want.abs().max(1.0) * 1e-3;
+                            let idx = (r * qh + h) * dim + i;
+                            let er =
+                                ((crate::num::f16_to_f32(oref[idx]) as f64 - want) / ulp).abs();
+                            let et =
+                                ((crate::num::f16_to_f32(otil[idx]) as f64 - want) / ulp).abs();
+                            worst_ref = worst_ref.max(er);
+                            worst_tiled = worst_tiled.max(et);
+                            if !er.is_finite() || !et.is_finite() || er > 8.0 || et > 8.0 {
+                                return Err(err!(
+                                    "selftest",
+                                    "prefill mismatch [{}] dim={} rows={} pos0={} row={} head={} \
+                                     elem={}: want {:.6}, ref {:.6} ({:.1} u), tiled {:.6} ({:.1} u)",
+                                    label,
+                                    dim,
+                                    rows,
+                                    pos0,
+                                    r,
+                                    h,
+                                    i,
+                                    want,
+                                    crate::num::f16_to_f32(oref[idx]),
+                                    er,
+                                    crate::num::f16_to_f32(otil[idx]),
+                                    et
+                                ));
+                            }
+                        }
+                    }
+                }
+                cases += 1;
+            }
+        }
+        println!(
+            "SELFTEST prefill {:<14} worst ref {:.1} u / tiled {:.1} u (tol 8)",
+            label, worst_ref, worst_tiled
+        );
+    }
+    println!(
+        "== prefill attention within tolerance ({} cases: 6 mask regimes x dim 128/256/512 \
+         x rows 1..130) ==",
+        cases
+    );
+    Ok(())
+}
+
 pub fn run_gemm(ctx: Arc<CudaCtx>) -> Res<()> {
     println!(
         "== f16 GEMM: native kernel vs f64 host reference, {} ==",

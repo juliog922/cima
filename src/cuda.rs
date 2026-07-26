@@ -331,10 +331,37 @@ unsafe fn try_load_cublas(stream: CUstream) -> Option<Blas> {
     if force_off || deterministic || opt_out {
         return None;
     }
-    let lib = ["libcublas.so.12\0", "libcublas.so.11\0", "libcublas.so\0"]
+    // Newest first. The unversioned symlink ships only in `devel` images, so a
+    // `runtime` container needs the versioned soname listed here -- an omission
+    // is invisible at build time and costs 5-10x on every prefill.
+    const CUBLAS_SONAMES: [&str; 6] = [
+        "libcublas.so.14\0",
+        "libcublas.so.13\0",
+        "libcublas.so.12\0",
+        "libcublas.so.11\0",
+        "libcublas.so\0",
+        "/usr/local/cuda/lib64/libcublas.so\0",
+    ];
+    let lib = match CUBLAS_SONAMES
         .iter()
         .map(|n| dlopen(n.as_ptr() as *const c_char, RTLD_NOW))
-        .find(|h| !h.is_null())?;
+        .find(|h| !h.is_null())
+    {
+        Some(h) => h,
+        None => {
+            crate::log::warn(&format!(
+                "cuBLAS not found (tried {}) -- falling back to the native \
+                 k_gemm_f16 prefill kernel, which is 5-10x slower. Install \
+                 libcublas or use a CUDA `runtime`/`devel` base image.",
+                CUBLAS_SONAMES
+                    .iter()
+                    .map(|s| s.trim_end_matches('\0'))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            return None;
+        }
+    };
     let sym = |name: &str| -> *mut c_void {
         let c = std::ffi::CString::new(name).unwrap();
         dlsym(lib, c.as_ptr())
@@ -635,6 +662,7 @@ struct KernelSet {
     argmax_softcap: CUfunction,
     argmax_extract: CUfunction,
     pos_bump: CUfunction,
+    attn_prefill_tiled: CUfunction,
     attn_decode_split: CUfunction,
     attn_reduce: CUfunction,
     gemv_f16: CUfunction,
@@ -839,6 +867,7 @@ impl CudaCtx {
                 pos_bump: f("k_pos_bump")?,
                 nf4_gemv: f("k_nf4_gemv")?,
                 nf4_gemv_ref: f("k_nf4_gemv_ref")?,
+                attn_prefill_tiled: f("k_attn_prefill_tiled")?,
                 attn_decode_split: f("k_attn_decode_split")?,
                 attn_reduce: f("k_attn_reduce")?,
                 gemv_f16: f("k_gemv_f16")?,
@@ -848,8 +877,15 @@ impl CudaCtx {
             };
 
             log::info(&format!(
-                "CUDA ready: {} (sm_{}{}), kernels JIT-compiled, cuBLAS bound",
-                device_name, maj, min
+                "CUDA ready: {} (sm_{}{}), kernels JIT-compiled, cuBLAS {}",
+                device_name,
+                maj,
+                min,
+                if blas.is_some() {
+                    "bound"
+                } else {
+                    "unavailable"
+                }
             ));
 
             Ok(CudaCtx {
@@ -1423,8 +1459,8 @@ impl CudaCtx {
             &mut pd as *mut _ as *mut c_void,
         ];
         debug_assert!(
-            dim % 32 == 0 && dim <= 256,
-            "warp-register accumulator bounds"
+            dim % 32 == 0 && dim <= 512,
+            "warp-register accumulator bounds (float[16] per lane)"
         );
         let threads = 128u32; // 4 warps striding the chunk's positions
         let shmem = (4 * (dim + 2) * 4) as u32;
@@ -1528,8 +1564,131 @@ impl CudaCtx {
     }
 
     /// Causal prefill attention for `rows` new tokens starting at `pos0`.
+    /// Tile width in keys, sized so the K and V tiles together stay inside a
+    /// 32 KiB shared-memory budget: 2 * bk * dim * 2 bytes <= 32768.
+    #[inline]
+    fn prefill_tile_keys(dim: usize) -> usize {
+        (8192 / dim).clamp(8, 64)
+    }
+
+    /// Can the tiled kernel serve this head geometry? Each lane owns `dim/32`
+    /// strided elements, bounded by the `float[16]` register arrays.
+    #[inline]
+    fn prefill_tiled_ok(dim: usize) -> bool {
+        dim % 32 == 0 && dim <= 512
+    }
+
+    /// Prefill attention. Dispatches to the tiled kernel where the geometry
+    /// allows, falling back to [`Self::attn_prefill_ref`] otherwise.
+    ///
+    /// `CIMA_PREFILL_REF=1` forces the reference kernel — the A/B lever for
+    /// `selftest attn` and for bisecting a suspected tiling bug without a
+    /// rebuild.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_prefill(
+        &self,
+        q: u64,
+        kc: u64,
+        vc: u64,
+        out: u64,
+        rows: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        pos0: usize,
+        max_seq: usize,
+        causal: bool,
+        scale: f32,
+        window: usize,
+        blkid: u64,
+    ) -> Res<()> {
+        let forced_ref = matches!(
+            std::env::var("CIMA_PREFILL_REF")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        );
+        if forced_ref || !Self::prefill_tiled_ok(dim) {
+            return self.attn_prefill_ref(
+                q, kc, vc, out, rows, q_heads, kv_heads, dim, pos0, max_seq, causal, scale, window,
+                blkid,
+            );
+        }
+        self.attn_prefill_tiled(
+            q, kc, vc, out, rows, q_heads, kv_heads, dim, pos0, max_seq, causal, scale, window,
+            blkid,
+        )
+    }
+
+    /// Flash-style tiled prefill: one warp per query row, `WARPS` queries
+    /// resident per block, K/V staged in shared memory and reused across them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_tiled(
+        &self,
+        q: u64,
+        kc: u64,
+        vc: u64,
+        out: u64,
+        rows: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        pos0: usize,
+        max_seq: usize,
+        causal: bool,
+        scale: f32,
+        window: usize,
+        blkid: u64,
+    ) -> Res<()> {
+        const BLOCK: u32 = 256;
+        const WARPS: usize = (BLOCK as usize) / 32;
+        let bk = Self::prefill_tile_keys(dim);
+        let shmem = 2 * bk * dim * 2; // two __half tiles
+        let (mut qa, mut ka, mut va, mut oa, mut ba) = (q, kc, vc, out, blkid);
+        let (mut qh, mut kh, mut da, mut pa, mut ma, mut na, mut ca, mut sc, mut wi, mut bkc) = (
+            q_heads as c_int,
+            kv_heads as c_int,
+            dim as c_int,
+            pos0 as c_int,
+            max_seq as c_int,
+            rows as c_int,
+            causal as c_int,
+            scale,
+            window as c_int,
+            bk as c_int,
+        );
+        let mut args = [
+            &mut qa as *mut _ as *mut c_void,
+            &mut ka as *mut _ as *mut c_void,
+            &mut va as *mut _ as *mut c_void,
+            &mut oa as *mut _ as *mut c_void,
+            &mut qh as *mut _ as *mut c_void,
+            &mut kh as *mut _ as *mut c_void,
+            &mut da as *mut _ as *mut c_void,
+            &mut pa as *mut _ as *mut c_void,
+            &mut ma as *mut _ as *mut c_void,
+            &mut na as *mut _ as *mut c_void,
+            &mut ca as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut wi as *mut _ as *mut c_void,
+            &mut ba as *mut _ as *mut c_void,
+            &mut bkc as *mut _ as *mut c_void,
+        ];
+        self.launch(
+            self.funcs.attn_prefill_tiled,
+            (rows.div_ceil(WARPS) as u32, q_heads as u32, 1),
+            BLOCK,
+            shmem as u32,
+            &mut args,
+        )
+    }
+
+    /// Reference prefill attention: one block per (row, head), serial key walk.
+    /// Kept as the tiled kernel's oracle in `selftest attn` and as the fallback
+    /// for head dims the tiled path cannot serve.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_ref(
         &self,
         q: u64,
         kc: u64,
@@ -2462,7 +2621,29 @@ fn find_cuda_include() -> Res<std::path::PathBuf> {
     ))
 }
 
-/// Compile `src` for `sm_{maj}{min}`, caching PTX under `./models/.ptx-cache`.
+/// Directory for the compiled-PTX cache.
+///
+/// Was hardcoded to `./models/.ptx-cache`, which breaks when a container
+/// writes it as its own uid inside a host-mounted models volume: the host
+/// service user then cannot evict a stale entry without root. Honours
+/// `CIMA_MODELS_DIR`, and `CIMA_PTX_CACHE` relocates it out of a shared
+/// mount entirely. Created group/other-writable so either uid can rotate it.
+fn ptx_cache_dir() -> std::path::PathBuf {
+    let dir = match std::env::var("CIMA_PTX_CACHE") {
+        Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => crate::hub::models_dir().join(".ptx-cache"),
+    };
+    if std::fs::create_dir_all(&dir).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+        }
+    }
+    dir
+}
+
+/// Compile `src` for `sm_{maj}{min}`, caching PTX under [`ptx_cache_dir`].
 fn compile_ptx(src: &str, maj: i32, min: i32) -> Res<CString> {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in src.bytes() {
@@ -2470,8 +2651,11 @@ fn compile_ptx(src: &str, maj: i32, min: i32) -> Res<CString> {
         h = h.wrapping_mul(0x100000001b3);
     }
     let cache = std::path::PathBuf::from(format!(
-        "./models/.ptx-cache/kernels_sm{}{}_{:016x}.ptx",
-        maj, min, h
+        "{}/kernels_sm{}{}_{:016x}.ptx",
+        ptx_cache_dir().display(),
+        maj,
+        min,
+        h
     ));
     if let Ok(bytes) = std::fs::read(&cache) {
         if let Ok(c) = CString::new(bytes) {
