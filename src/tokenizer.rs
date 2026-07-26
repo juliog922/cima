@@ -765,6 +765,27 @@ pub struct ChatTurn {
 /// `tokenizer_config.json`'s `chat_template` (substring heuristics over the
 /// Jinja source — full Jinja evaluation is out of scope and unnecessary for
 /// the ChatML/Llama-3 families that dominate the Hub).
+/// Remove `<|channel>…<channel|>` thought spans from assistant text.
+///
+/// Mirrors the `strip_thinking` macro in the official gemma-4 template: split
+/// on the closing marker, and for any piece containing an opening marker keep
+/// only what precedes it. Text before the first open and after the last close
+/// survives, so a well-formed answer is untouched and an unterminated span is
+/// dropped rather than leaked.
+pub fn strip_thought(text: &str) -> String {
+    if !text.contains("<|channel>") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for part in text.split("<channel|>") {
+        match part.find("<|channel>") {
+            Some(i) => out.push_str(&part[..i]),
+            None => out.push_str(part),
+        }
+    }
+    out.trim().to_string()
+}
+
 pub fn render_chat(
     dir: &Path,
     tk: &BpeTokenizer,
@@ -902,6 +923,18 @@ pub fn render_chat(
                 crate::log::warn("gemma template owns BOS but the bos id has no special literal; sequence starts without BOS");
             }
         }
+        // Gemma 4 renamed its turn markers and added a reasoning channel.
+        // Only treat the channel as present when BOTH markers are real
+        // specials — otherwise they would tokenize as plain text and end up
+        // as literal characters in the prompt.
+        let thought_channel = in_vocab("<|channel>") && in_vocab("<channel|>");
+        // The template's own default is `enable_thinking | default(false)`.
+        let enable_thinking = std::env::var("CIMA_G4_THINK")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            == Some("1");
+
         let mut sys = String::new();
         for t in turns {
             if t.role == "system" {
@@ -930,10 +963,22 @@ pub fn render_chat(
             for _ in 0..t.n_audio {
                 out.push_str("<audio>");
             }
-            out.push_str(&t.content);
+            // Prior model turns are fed back without their reasoning, per
+            // the template's strip_thinking macro. Keeping it would teach the
+            // model that thought spans belong in the visible transcript.
+            if role == "model" && thought_channel {
+                out.push_str(&strip_thought(&t.content));
+            } else {
+                out.push_str(&t.content);
+            }
             out.push_str(&format!("{}\n", eot));
         }
         out.push_str(&format!("{}model\n", sot));
+        if thought_channel && !enable_thinking {
+            // Open and immediately close the thought channel. Without this the
+            // model opens it itself and the markers leak into the answer.
+            out.push_str("<|channel>thought\n<channel|>");
+        }
         return out;
     }
     if llama3 {

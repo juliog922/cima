@@ -31,8 +31,17 @@ pub(crate) mod config {
         pub n_layers: usize,
         pub n_heads: usize,
         pub n_kv_heads: usize,
+        /// `num_global_key_value_heads` — full-attention layers carry their own
+        /// GQA ratio (31B: 16 kv heads sliding, 4 full). Defaults to
+        /// `n_kv_heads` when the field is absent (E2B/E4B).
+        pub n_global_kv_heads: usize,
         pub head_dim: usize,        // sliding layers
         pub global_head_dim: usize, // full layers
+        /// `attention_k_eq_v`: on full-attention layers the checkpoint ships no
+        /// `v_proj`. K and V share one projection, then diverge — K takes the
+        /// learned per-head norm plus rotary, V takes the weightless norm and
+        /// no rotary. Sliding layers are unaffected.
+        pub k_eq_v: bool,
         pub inter: usize,
         pub vocab: usize,
         pub rms_eps: f32,
@@ -142,12 +151,8 @@ pub(crate) mod config {
                     "gemma4: enable_moe_block=true (MoE) is not implemented in this engine"
                 ));
             }
-            if t.bool_of("attention_k_eq_v").unwrap_or(false) {
-                return Err(err!(
-                    "config",
-                    "gemma4: attention_k_eq_v=true (K==V global attention) is not implemented"
-                ));
-            }
+            // attention_k_eq_v is implemented (see the header of this patch and
+            // the k_eq_v field docs); parsed below rather than rejected.
             if let Some(b) = t.str_of("use_bidirectional_attention") {
                 if b == "all" {
                     return Err(err!(
@@ -261,6 +266,17 @@ pub(crate) mod config {
                     n_kv_heads
                 ));
             }
+            let n_global_kv_heads = t.usize_or("num_global_key_value_heads", n_kv_heads);
+            if n_global_kv_heads == 0 || n_heads % n_global_kv_heads != 0 {
+                return Err(err!(
+                    "config",
+                    "gemma4: num_attention_heads {} not divisible by \
+                     num_global_key_value_heads {}",
+                    n_heads,
+                    n_global_kv_heads
+                ));
+            }
+            let k_eq_v = t.bool_of("attention_k_eq_v").unwrap_or(false);
             let n_kv_shared = t.usize_or("num_kv_shared_layers", 0);
             if n_kv_shared >= n_layers {
                 return Err(err!(
@@ -310,8 +326,10 @@ pub(crate) mod config {
                 n_layers,
                 n_heads,
                 n_kv_heads,
+                n_global_kv_heads,
                 head_dim,
                 global_head_dim,
+                k_eq_v,
                 inter: ru(t, "intermediate_size")?,
                 vocab: ru(t, "vocab_size")?,
                 rms_eps: t.f32_or("rms_norm_eps", 1e-6),

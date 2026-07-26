@@ -179,6 +179,9 @@ struct G4Layer {
     /// Index of the layer whose cache this layer reads (== own index when not shared).
     kv_src: usize,
     head_dim: usize,
+    /// KV head count for THIS layer: `n_kv_heads` on sliding layers,
+    /// `n_global_kv_heads` on full ones. The two differ on 31B-class models.
+    kv_heads: usize,
     inter: usize,
     theta: f32,
     nfreqs: usize,
@@ -330,13 +333,14 @@ impl Gemma4 {
             if i >= first_shared {
                 continue;
             }
-            let d = match ty {
-                LayerType::Sliding => t.head_dim,
-                LayerType::Full => t.global_head_dim,
+            let (d, kvh) = match ty {
+                LayerType::Sliding => (t.head_dim, t.n_kv_heads),
+                LayerType::Full => (t.global_head_dim, t.n_global_kv_heads),
             };
-            kv_bytes += 2 * t.n_kv_heads * t.max_seq * d * 2;
+            kv_bytes += 2 * kvh * t.max_seq * d * 2;
         }
         let dmax = t.head_dim.max(t.global_head_dim);
+        let kvhmax = t.n_kv_heads.max(t.n_global_kv_heads);
         let imax = if t.double_wide_mlp {
             t.inter * 2
         } else {
@@ -344,7 +348,7 @@ impl Gemma4 {
         };
         let mut ws = CHUNK * t.hidden * 2 * 3                     // x, h, h2
             + CHUNK * t.n_heads * dmax * 2 * 2                    // q, att
-            + CHUNK * t.n_kv_heads * dmax * 2 * 2                 // k, v
+            + CHUNK * kvhmax * dmax * 2 * 2                       // k, v
             + CHUNK * imax * 2 * 2                                // gate, up
             + t.max_seq * 4                                       // blkid
             + CHUNK * 4                                           // ids
@@ -491,13 +495,16 @@ impl Gemma4 {
             #[allow(clippy::needless_range_loop)]
             for i in 0..t.n_layers {
                 let ty = t.layer_types[i];
-                let d = if ty == LayerType::Sliding {
-                    t.head_dim
+                let (d, kvh) = if ty == LayerType::Sliding {
+                    (t.head_dim, t.n_kv_heads)
                 } else {
-                    t.global_head_dim
+                    (t.global_head_dim, t.n_global_kv_heads)
                 };
                 let qd = t.n_heads * d;
-                let kvd = t.n_kv_heads * d;
+                let kvd = kvh * d;
+                // Full-attention layers under attention_k_eq_v have no v_proj
+                // in the checkpoint; V is derived from the k_proj output.
+                let k_eq_v_here = t.k_eq_v && ty == LayerType::Full;
                 let shared = i >= first_shared;
                 let inter = if shared && t.double_wide_mlp {
                     t.inter * 2
@@ -553,7 +560,7 @@ impl Gemma4 {
                     } else {
                         Some(ix.upload_w(&p("self_attn.k_proj.weight"), kvd, hs)?)
                     },
-                    wv: if shared {
+                    wv: if shared || k_eq_v_here {
                         None
                     } else {
                         Some(ix.upload_w(&p("self_attn.v_proj.weight"), kvd, hs)?)
@@ -609,12 +616,13 @@ impl Gemma4 {
                         None
                     } else {
                         Some((
-                            ctx.alloc(t.n_kv_heads * t.max_seq * d * 2)?,
-                            ctx.alloc(t.n_kv_heads * t.max_seq * d * 2)?,
+                            ctx.alloc(kvh * t.max_seq * d * 2)?,
+                            ctx.alloc(kvh * t.max_seq * d * 2)?,
                         ))
                     },
                     kv_src,
                     head_dim: d,
+                    kv_heads: kvh,
                     inter,
                     theta: if ty == LayerType::Sliding {
                         t.theta_sliding
@@ -657,8 +665,8 @@ impl Gemma4 {
                 h: ctx.alloc(CHUNK * hs * 2)?,
                 h2: ctx.alloc(CHUNK * hs * 2)?,
                 q: ctx.alloc(CHUNK * t.n_heads * dmax * 2)?,
-                k: ctx.alloc(CHUNK * t.n_kv_heads * dmax * 2)?,
-                v: ctx.alloc(CHUNK * t.n_kv_heads * dmax * 2)?,
+                k: ctx.alloc(CHUNK * t.n_kv_heads.max(t.n_global_kv_heads) * dmax * 2)?,
+                v: ctx.alloc(CHUNK * t.n_kv_heads.max(t.n_global_kv_heads) * dmax * 2)?,
                 att: ctx.alloc(CHUNK * t.n_heads * dmax * 2)?,
                 gate: ctx.alloc(CHUNK * imax * 2)?,
                 up: ctx.alloc(CHUNK * imax * 2)?,
@@ -808,7 +816,13 @@ impl Gemma4 {
                 .collect();
             let card = format!(
                 "model card [gemma4]\n  text: hidden={} layers={} heads={} kv_heads={} vocab={} max_seq={}\n  layer types ({}=sliding {}=full): {}\n  head_dim: sliding={} full={}  attn scale=1.0 (no 1/sqrt(d))\n  rope: sliding theta={} full theta={} nfreqs={} (proportional partial-rotary)\n  sliding window={}  kv share (layer→src): {}\n  PLE: dim={} table+context-projection, identity uses PAD at media rows, projection consumes spliced soft tokens, combine ×1/√2\n  norms: sandwich (pre/post attn + pre/post ffw), q/k per-head RMSNorm, weightless v-norm\n  softcap: final={}  specials: pad={} eos={:?} img={} aud={}",
-                t.hidden, t.n_layers, t.n_heads, t.n_kv_heads, t.vocab, t.max_seq,
+                t.hidden, t.n_layers, t.n_heads,
+                if t.n_kv_heads == t.n_global_kv_heads {
+                    format!("{}", t.n_kv_heads)
+                } else {
+                    format!("{}/{} (sliding/full)", t.n_kv_heads, t.n_global_kv_heads)
+                },
+                t.vocab, t.max_seq,
                 'S', 'F', types,
                 t.head_dim, t.global_head_dim,
                 t.theta_sliding, t.theta_full, t.full_nfreqs,
@@ -1153,7 +1167,8 @@ impl Gemma4 {
         let t = &self.cfg.text;
         let ctx = &self.ctx;
         let hs = t.hidden;
-        let kvh = t.n_kv_heads;
+        // kvh is resolved per layer below; full-attention layers can carry a
+        // different GQA ratio than sliding ones.
         let nh = t.n_heads;
         // CIMA_TRACE_LAYER=N (with CIMA_DUMP_LM): sub-layer snapshots of the
         // last row at layer N — the op-level bisection probe.
@@ -1221,6 +1236,7 @@ impl Gemma4 {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let d = layer.head_dim;
+            let kvh = layer.kv_heads;
             let (qd, kvd) = (nh * d, kvh * d);
 
             // ---- attention ----
@@ -1275,8 +1291,7 @@ impl Gemma4 {
                 eprintln!("g4 fp L{}: q_postrope_sumsq={:.4}", i, q_ss);
             }
 
-            if let (Some(wk), Some(wv), Some(k_norm), Some((kc, vc))) =
-                (&layer.wk, &layer.wv, &layer.k_norm, &layer.kv)
+            if let (Some(wk), Some(k_norm), Some((kc, vc))) = (&layer.wk, &layer.k_norm, &layer.kv)
             {
                 wk.gemm(
                     ctx,
@@ -1287,6 +1302,13 @@ impl Gemma4 {
                     hs,
                     self.ws.wsc.ptr,
                 )?;
+                // attention_k_eq_v: V is the RAW k_proj output. The reference
+                // aliases value_states to key_states, then rebinds key_states
+                // through k_norm and rotary — so V sees neither. Snapshot the
+                // projection into ws.v BEFORE k_norm rewrites ws.k in place.
+                if layer.wv.is_none() {
+                    ctx.dtod(self.ws.v.ptr, self.ws.k.ptr, rows * kvd * 2)?;
+                }
                 ctx.rmsnorm(
                     self.ws.k.ptr,
                     k_norm.ptr,
@@ -1306,15 +1328,17 @@ impl Gemma4 {
                     pos_dev,
                     layer.rope_factors.as_ref().map(|b| b.ptr).unwrap_or(0),
                 )?;
-                wv.gemm(
-                    ctx,
-                    self.ws.h.ptr,
-                    self.ws.v.ptr,
-                    rows,
-                    kvd,
-                    hs,
-                    self.ws.wsc.ptr,
-                )?;
+                if let Some(wv) = &layer.wv {
+                    wv.gemm(
+                        ctx,
+                        self.ws.h.ptr,
+                        self.ws.v.ptr,
+                        rows,
+                        kvd,
+                        hs,
+                        self.ws.wsc.ptr,
+                    )?;
+                }
                 // V-RMSNorm is scale-less (`with_scale=False`): w == NULL.
                 ctx.rmsnorm(self.ws.v.ptr, 0, self.ws.v.ptr, rows * kvh, d, t.rms_eps)?;
                 ctx.kv_append(
@@ -2715,8 +2739,13 @@ impl crate::traits::Architecture for Gemma4 {
             // codecs (fusion needs same-codec runs) and the sliding-window
             // layers still use the monolithic attention kernel.
             fused_weights: false,
-            seq_parallel_attention: true, // both head_dim variants are 32-multiples <= 256
-            device_pipeline: false,       // PLE gathers a host table by token id
+            // The seq-parallel path wants a 32-multiple head_dim within the
+            // kernel's register budget; global_head_dim is 512 on 31B-class
+            // models, so this is no longer unconditionally true.
+            seq_parallel_attention: self.cfg.text.head_dim % 32 == 0
+                && self.cfg.text.global_head_dim % 32 == 0
+                && self.cfg.text.global_head_dim <= 256,
+            device_pipeline: false, // PLE gathers a host table by token id
         }
     }
 }

@@ -329,7 +329,11 @@ fn dispatch(args: &[String]) -> Res<()> {
                 .transpose()?;
             // Pull first when absent — vet is the one-command path from
             // "found a checkpoint" to "know whether cima serves it".
-            if !hub::local_dir(&model).join("config.json").exists() {
+            // Use the shared locality test: it knows both directory
+            // layouts and verifies the quant tag against the files present.
+            // A bespoke check here re-downloaded models that were already on
+            // disk under the other layout.
+            if !hub::is_local(&model) {
                 println!("model not local — pulling first…");
                 hub::pull(&model, false, None)?;
             }
@@ -695,12 +699,72 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+/// Exact KV bytes for a layer-heterogeneous gemma4 checkpoint, mirroring the
+/// per-layer allocation in `models::gemma4`.
+///
+/// Returns None when this is not gemma4 or no config.json sits beside the
+/// weights, in which case the caller keeps the uniform estimate. Reading
+/// config.json rather than GGUF metadata is deliberate: the GGUF stores
+/// `head_count_kv` as a per-layer array that `meta_usize` cannot decode, and
+/// carries no `head_count_kv_swa` at all, so the metadata alone cannot
+/// describe a heterogeneous model.
+fn gemma4_kv_bytes(weights_path: &std::path::Path, cfg: &models::ModelConfig) -> Option<usize> {
+    use cima::models::gemma4::{G4Config, LayerType};
+    if cfg.model_type != "gemma4" {
+        return None;
+    }
+    let raw = std::fs::read_to_string(weights_path.parent()?.join("config.json")).ok()?;
+    let t = G4Config::parse(&json::parse(&raw).ok()?).ok()?.text;
+    let first_shared = t.n_layers.saturating_sub(t.n_kv_shared);
+    let mut bytes = 0usize;
+    for (i, ty) in t.layer_types.iter().enumerate() {
+        if i >= first_shared {
+            continue; // shared layers read another layer's cache
+        }
+        let (d, kvh) = match ty {
+            LayerType::Sliding => (t.head_dim, t.n_kv_heads),
+            LayerType::Full => (t.global_head_dim, t.n_global_kv_heads),
+        };
+        bytes += 2 * kvh * t.max_seq * d * 2; // K and V, f16
+    }
+    Some(bytes)
+}
+
+/// Bytes of mmproj tower sidecars beside `weights_path`. They load with the
+/// LM, so leaving them out understates the device footprint.
+fn mmproj_bytes(weights_path: &std::path::Path) -> usize {
+    weights_path
+        .parent()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+                    n.ends_with(".gguf") && n.contains("mmproj")
+                })
+                .filter_map(|e| e.metadata().ok().map(|m| m.len() as usize))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// Shared preflight: download only config.json and run the full architecture
 /// validation gate. Returns the parsed config on success so callers can print
 /// a verdict without re-reading.
 fn preflight(model: &str) -> Res<models::ModelConfig> {
     let dir = hub::pull_config(model)?;
-    models::ModelConfig::load(&dir)
+    let cfg = models::ModelConfig::load(&dir)?;
+    // ModelConfig::load validates the generic surface (model_type, dtypes).
+    // Family-specific gates live in the family's own parser, and until now
+    // they only ran at load time — so `cima check` could green-light a
+    // checkpoint the loader would refuse, after a multi-gigabyte pull.
+    if cfg.model_type == "gemma4" {
+        let raw = std::fs::read_to_string(dir.join("config.json"))
+            .map_err(|e| cima::err!("cli", "reading config.json: {}", e))?;
+        let j = json::parse(&raw).map_err(|e| cima::err!("cli", "config.json: {}", e))?;
+        models::gemma4::G4Config::parse(&j)?;
+    }
+    Ok(cfg)
 }
 
 /// `cima check <MODEL>` — answer "will this run?" without downloading
@@ -963,7 +1027,23 @@ fn check_gguf(repo: &str, tag: Option<&str>, dump_meta: bool) -> Res<()> {
                 cuda::fmt_bytes(b)
             );
         }
-        let kv = cfg.n_layers * 2 * cfg.n_kv_heads * cfg.max_seq * cfg.head_dim * 2;
+        // Uniform sizing is wrong for layer-heterogeneous architectures; use
+        // the per-layer figure when the checkpoint lets us compute one.
+        let (kv, kv_exact) = match gemma4_kv_bytes(&path, &cfg) {
+            Some(b) => (b, true),
+            None => (
+                cfg.n_layers * 2 * cfg.n_kv_heads * cfg.max_seq * cfg.head_dim * 2,
+                false,
+            ),
+        };
+        let mmproj = mmproj_bytes(&path);
+        if mmproj > 0 {
+            weights += mmproj;
+            println!(
+                "  (+ {} mmproj tower sidecar, loaded with the LM)",
+                cuda::fmt_bytes(mmproj)
+            );
+        }
         let ws = (weights / 25).max(64 << 20);
         println!(
             "  arch={} layers={} hidden={} vocab={} — file {}",
@@ -973,11 +1053,13 @@ fn check_gguf(repo: &str, tag: Option<&str>, dump_meta: bool) -> Res<()> {
             cfg.vocab_size,
             path.file_name().unwrap_or_default().to_string_lossy()
         );
-        let kv_note = if w
-            .meta_usize(&format!("{}.full_attention_interval", cfg.model_type))
-            .is_some()
+        let kv_note = if !kv_exact
+            && w.meta_usize(&format!("{}.full_attention_interval", cfg.model_type))
+                .is_some()
         {
             " (upper bound: hybrid SSM layers carry recurrent state, not KV)"
+        } else if kv_exact {
+            " (per layer type)"
         } else {
             ""
         };

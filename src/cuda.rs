@@ -290,17 +290,24 @@ const RTLD_NOW: c_int = 2;
 
 /// Try to bring up cuBLAS from a dlopened library; None ⇒ native GEMM path.
 ///
-/// Determinism-first default: cuBLAS is used ONLY when the operator opts in
-/// with `CIMA_CUBLAS=1`. Left off, the prefill GEMM runs the native
-/// `k_gemm_f16` kernel, whose reduction order is fixed, so repeated identical
-/// greedy requests are bit-reproducible. cuBLAS (even with atomics disabled
-/// and an algorithm pinned) selects tensor-core kernels whose accumulation
-/// order varies run-to-run on this hardware, which over a long greedy decode
-/// flips an argmax tie and changes the output — measured directly (md5
-/// differs with cuBLAS on, identical with it off). Enabling `CIMA_CUBLAS=1`
-/// trades that reproducibility for faster tensor-core prefill.
-/// `CIMA_NO_CUBLAS=1` is still honored as an explicit force-off (it wins over
-/// `CIMA_CUBLAS`) so existing scripts keep working.
+/// Speed-first default: cuBLAS drives the prefill GEMM unless the operator
+/// asks for reproducibility. The native `k_gemm_f16` computes one output
+/// element per thread through fp32 shared memory with no register tiling and
+/// no tensor cores; measured on an L40S it reaches ~3.9 TFLOPS against the
+/// device's ~362 dense FP16, costing 5-10x on every prefill (585 tok: 9.5s
+/// vs 0.97s; 6704 tok: 122s vs 24.9s). Decode is unaffected either way — it
+/// runs the GEMV path.
+///
+/// The tradeoff is real and remains one env var away. cuBLAS (even with
+/// atomics disabled and an algorithm pinned) picks tensor-core kernels whose
+/// accumulation order varies run-to-run on this hardware, which over a long
+/// greedy decode can flip an argmax tie and change the output — measured
+/// directly (md5 differs with cuBLAS on, identical with it off). Set
+/// `CIMA_DETERMINISTIC=1` for the native kernel's fixed reduction order and
+/// bit-reproducible greedy decode.
+///
+/// `CIMA_NO_CUBLAS=1` keeps working as an explicit force-off, and
+/// `CIMA_CUBLAS=0` also forces off, so existing scripts are unaffected.
 unsafe fn try_load_cublas(stream: CUstream) -> Option<Blas> {
     let force_off = matches!(
         std::env::var("CIMA_NO_CUBLAS")
@@ -309,11 +316,19 @@ unsafe fn try_load_cublas(stream: CUstream) -> Option<Blas> {
             .map(str::trim),
         Some("1") | Some("true") | Some("yes") | Some("on")
     );
-    let opt_in = matches!(
-        std::env::var("CIMA_CUBLAS").ok().as_deref().map(str::trim),
+    let deterministic = matches!(
+        std::env::var("CIMA_DETERMINISTIC")
+            .ok()
+            .as_deref()
+            .map(str::trim),
         Some("1") | Some("true") | Some("yes") | Some("on")
     );
-    if force_off || !opt_in {
+    // Explicit CIMA_CUBLAS=0 still forces the native path.
+    let opt_out = matches!(
+        std::env::var("CIMA_CUBLAS").ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    );
+    if force_off || deterministic || opt_out {
         return None;
     }
     let lib = ["libcublas.so.12\0", "libcublas.so.11\0", "libcublas.so\0"]
@@ -702,8 +717,8 @@ impl CudaCtx {
 
             let blas = try_load_cublas(stream);
             crate::log::info(match &blas {
-                Some(_) => "prefill GEMM: cuBLAS (dlopened, tensor cores — faster, NOT bit-reproducible; opted in via CIMA_CUBLAS=1)",
-                None => "prefill GEMM: native k_gemm_f16 kernel (deterministic default; set CIMA_CUBLAS=1 for faster tensor-core prefill)",
+                Some(_) => "prefill GEMM: cuBLAS tensor cores (default; NOT bit-reproducible — set CIMA_DETERMINISTIC=1 for the native kernel)",
+                None => "prefill GEMM: native k_gemm_f16 (bit-reproducible; 5-10x slower prefill than cuBLAS)",
             });
             stage("cublas-probe");
 

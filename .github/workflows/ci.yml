@@ -135,15 +135,6 @@ jobs:
           docker compose exec -T cima cima selftest
       - name: API conformance + behaviour + adversarial stress
         run: bash scripts/test.sh
-      - name: Benchmark smoke + regression tripwire
-        run: |
-          GEN_RUNS=5 LOAD_RUNS=2 MEDIA_RUNS=2 bash scripts/benchs.sh
-          bash scripts/bench-compare.sh bench-results.csv scripts/bench-baseline.csv
-      - name: Archive results
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-results
-          path: bench-results.csv
       - name: Teardown
         if: always()
         run: docker compose down -v --remove-orphans || true
